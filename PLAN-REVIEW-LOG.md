@@ -177,3 +177,18 @@ Verified independently:
 - No dependencies beyond Kotlin + JUnit5 + kotlin.test. grep hits for "android/arcore/..."
   are prose comments only, not build deps.
 Clean build, faithful to spec, no scope creep. Ready for human sign-off.
+
+---
+
+# Plan 2 (persistence) — Codex review, 4 rounds → APPROVED
+
+Adversarial review of the Room persistence implementation plan. Trajectory: 18 → 9 → 2(+3 doc) → 0.
+
+Round 1 (18): **snapped geometry was dead data** — toDomain re-ran buildFloorPlan(snapped=true) instead of loading stored snapped corners, so a future tolerance change could silently alter/reject a saved plan; non-transactional aggregate load; REPLACE deletes parents before reinsert (cascade wipe); no one-room guard; no ownership checks; unordered objects; no draft state; **ksp{} inside android{} (build-breaking)**; schema not packaged as test assets; **Robolectric 4.13 can't run API 35**; Room/KSP-vs-Kotlin-2 compat unproven; TDD ordering claims.
+Round 2 (9): snap-applied inferred from coordinate inequality (zero-displacement snap reloads unsnapped); invalid stored snap silently discarded; building load still split across transactions; **assertFailsWith missing dependency (build-breaking)**; save guards didn't enforce load-side structural invariants; +minor.
+Round 3 (2+3): rollback test failed at a guard before any write (didn't prove rollback); invalid-raw path bypassed the corrupt-snap check; +3 doc inconsistencies.
+Round 4: **APPROVED** (one trivial comment fixed).
+
+Key fixes: `core.floorPlanFromStored(raw, storedSnappedCorners: List<Vec2>?, objects)` — explicit snap state, verbatim stored geometry, throws on corruption; `@Upsert` + explicit prior-room delete (no REPLACE cascade); `@Transaction loadBuildingAggregate`; ownership + contiguous-index + snapped-parity `require`s; `ScanStatus` draft state; top-level `ksp{}`; Robolectric 4.14.1 + `@Config(sdk=[34])`; real mid-transaction rollback test (duplicate PK).
+
+Rejected with reason (2): stable per-object DB ID (value-like v1 markers, no cross-session reference, would ripple through shipped Plan 1) — deferred to v2; moving Room DAO tests before the DAO/@Database declaration (impossible — KSP must generate the impl first; real red phase is behavioral).
