@@ -134,12 +134,17 @@ class YuvToRgbaTest {
         assertEquals(255, rgba[2].toInt() and 0xFF)   // B
     }
 
-    @Test fun `honours a uv pixel stride of 2 (semi-planar NV21-like)`() {
-        // interleaved UV with pixelStride 2: only every other byte is the U (or V) sample
-        val y = ByteArray(4) { 128.toByte() }
-        val uv = byteArrayOf(128.toByte(), 0, 128.toByte(), 0)   // stride 2 -> samples at 0 and 2
-        val rgba = yuvToRgba(2, 2, y, uv, uv, yRowStride = 2, uvRowStride = 4, uvPixelStride = 2)
-        assertEquals(2 * 2 * 4, rgba.size)   // must not read the interleaved gaps as chroma
+    @Test fun `honours a uv pixel stride of 2 — reads the SECOND chroma sample, not the gap`() {
+        // width 4 -> 2 chroma columns. pixelStride 2: col0 U at offset 0, col1 U at offset 2 (offsets 1,3 are gaps).
+        val y = ByteArray(8) { 128.toByte() }                        // yRowStride 4, height 2
+        val u = byteArrayOf(128.toByte(), 0, 200.toByte(), 0)        // left neutral, RIGHT high-U (blue)
+        val v = byteArrayOf(128.toByte(), 0, 128.toByte(), 0)        // neutral V
+        val rgba = yuvToRgba(4, 2, y, u, v, yRowStride = 4, uvRowStride = 4, uvPixelStride = 2)
+        val leftB = rgba[(0 * 4 + 0) * 4 + 2].toInt() and 0xFF       // px (0,0) blue
+        val rightB = rgba[(0 * 4 + 2) * 4 + 2].toInt() and 0xFF      // px (0,2) blue — uses chroma offset 2
+        assertEquals(128, leftB)                                     // neutral
+        // if pixelStride were ignored (reading the 0 at offset 1) the right blue would be 0, not high
+        assertEquals(true, rightB > 200)
     }
 
     @Test fun `honours Y row-stride padding (does not read padding bytes as pixels)`() {
@@ -172,8 +177,13 @@ fun yuvToRgba(
     yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
 ): ByteArray {
     require(width > 0 && height > 0) { "non-positive dimensions" }
+    require(yRowStride > 0 && uvRowStride > 0 && uvPixelStride > 0) { "non-positive stride" }
     require(width.toLong() * height <= Int.MAX_VALUE / 4L) { "image too large" }
-    require(y.size >= (height - 1) * yRowStride + width) { "Y buffer too small for stride" }
+    // required buffer extents computed in Long so they can't overflow before the bounds check
+    val cw = (width + 1) / 2; val ch = (height + 1) / 2   // 4:2:0 chroma dims (ceil)
+    require(y.size.toLong() >= (height - 1).toLong() * yRowStride + width) { "Y buffer too small for stride" }
+    val uvNeed = (ch - 1).toLong() * uvRowStride + (cw - 1).toLong() * uvPixelStride + 1
+    require(u.size.toLong() >= uvNeed && v.size.toLong() >= uvNeed) { "U/V buffer too small for stride" }
     val out = ByteArray(width * height * 4)
     for (row in 0 until height) {
         val uvRow = (row / 2) * uvRowStride
@@ -293,30 +303,39 @@ import com.google.ar.core.TrackingState
 import itr.core.ar.*
 import itr.core.geometry.Vec3
 
+/** The v1 canonical transform: the detector consumes the full unrotated CPU image. Named so callers
+ *  pass it EXPLICITLY rather than relying on a silent default (Plan 4 supplies its real transform). */
+val UnrotatedFullImageTransform: (CameraIntrinsics) -> ImageTransform = { k ->
+    ImageTransform(k.width, k.height, 0, 0, k.width, k.height, k.width, k.height, 0, false)
+}
+
 class ArCoreFrame(
     private val frame: Frame,
     private val session: Session,
     private val registry: PlaneRegistry,
     private val frameId: Long,
     private val basisRevision: Int,
-    /** The EXACT transform Plan 4's detector preprocessing applies (crop/scale/rotation/mirror). The
-     *  default full-image identity is only correct if the detector consumes the unrotated CPU image. */
-    private val imageTransform: (CameraIntrinsics) -> ImageTransform = { k ->
-        ImageTransform(k.width, k.height, 0, 0, k.width, k.height, k.width, k.height, 0, false) },
-    private val viewWidth: Int = 0, private val viewHeight: Int = 0,   // active display geometry (0 = unset)
+    private val imageTransform: (CameraIntrinsics) -> ImageTransform,   // mandatory (Plan 4's exact transform)
+    private val viewWidth: Int, private val viewHeight: Int,            // active display geometry (0 = unset)
+    private val assertThread: () -> Unit,                              // AR-frame-thread guard (escaped frames too)
 ) : ArFrameRef {
     override val record: FrameRecord get() {
+        assertThread()
         val cam = frame.camera; val intr = cam.imageIntrinsics
         val f = intr.focalLength; val pp = intr.principalPoint; val dim = intr.imageDimensions
         val k = CameraIntrinsics(f[0].toDouble(), f[1].toDouble(), pp[0].toDouble(), pp[1].toDouble(), dim[0], dim[1])
         return FrameRecord(frameId, frame.timestamp, basisRevision, cam.pose.toAr(), k, imageTransform(k))
     }
-    override val trackingOk: Boolean get() = frame.camera.trackingState == TrackingState.TRACKING
-    override fun currentPlanes(): List<ArPlaneRef> =
-        session.getAllTrackables(ArcPlane::class.java).map { ArCorePlane(it, registry) }   // full current set
+    override val trackingOk: Boolean get() { assertThread(); return frame.camera.trackingState == TrackingState.TRACKING }
+    override fun currentPlanes(): List<ArPlaneRef> {
+        assertThread()
+        return session.getAllTrackables(ArcPlane::class.java).map { ArCorePlane(it, registry) }   // full current set
+    }
     override fun hitTest(point: DisplayPoint): Pair<ArPlaneRef, Vec3>? {
-        // the tap's view geometry MUST match the geometry set via setDisplayGeometry, else the hit is wrong
-        require(viewWidth == 0 || (point.viewWidth == viewWidth && point.viewHeight == viewHeight)) {
+        assertThread()
+        // display geometry MUST be set and match the tap's view, else frame.hitTest is meaningless
+        require(viewWidth > 0 && viewHeight > 0) { "hitTest before display geometry was set" }
+        require(point.viewWidth == viewWidth && point.viewHeight == viewHeight) {
             "DisplayPoint view ${point.viewWidth}x${point.viewHeight} != active geometry ${viewWidth}x$viewHeight"
         }
         for (h in frame.hitTest(point.x.toFloat(), point.y.toFloat())) {
@@ -344,8 +363,9 @@ import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException   // 1.43.0: exceptions package
 import itr.core.ar.*
 
-/** Lifecycle callbacks the app wires to SceneView (which owns the real session lifecycle). */
-class SessionLifecycle(val onResume: () -> Unit = {}, val onPause: () -> Unit = {}, val onClose: () -> Unit = {})
+/** Lifecycle callbacks the app MUST wire to SceneView (which owns the real session lifecycle). No
+ *  defaults — forgetting to wire one must be a compile error, not a silent no-op. */
+class SessionLifecycle(val onResume: () -> Unit, val onPause: () -> Unit, val onClose: () -> Unit)
 
 /**
  * ArSessionRef over an ARCore session that SceneView OWNS. The app forwards SceneView's
@@ -356,9 +376,8 @@ class SessionLifecycle(val onResume: () -> Unit = {}, val onPause: () -> Unit = 
 class ArCoreSession(
     private val context: Context,
     private val session: Session,
-    private val lifecycle: SessionLifecycle = SessionLifecycle(),
-    private val imageTransform: (CameraIntrinsics) -> ImageTransform = { k ->
-        ImageTransform(k.width, k.height, 0, 0, k.width, k.height, k.width, k.height, 0, false) },
+    private val lifecycle: SessionLifecycle,                             // mandatory (wire to SceneView)
+    private val imageTransform: (CameraIntrinsics) -> ImageTransform,    // mandatory (pass UnrotatedFullImageTransform or Plan 4's)
     private val registry: PlaneRegistry = PlaneRegistry(),
 ) : ArSessionRef {
     private var thread: Thread? = null
@@ -382,7 +401,8 @@ class ArCoreSession(
     fun onDisplayGeometry(rotation: Int, widthPx: Int, heightPx: Int) {
         assertThread()
         require(widthPx > 0 && heightPx > 0) { "non-positive view size" }
-        geomRotation = rotation; geomW = widthPx; geomH = heightPx      // rotation is a Surface.ROTATION_* constant
+        require(rotation in 0..3) { "rotation must be a Surface.ROTATION_* constant (0..3), got $rotation" }
+        geomRotation = rotation; geomW = widthPx; geomH = heightPx
         session.setDisplayGeometry(rotation, widthPx, heightPx)
     }
 
@@ -396,13 +416,13 @@ class ArCoreSession(
         ArCoreApk.Availability.UNKNOWN_ERROR -> AvailabilityResult.CheckFailed
     }
 
-    override fun resume() = lifecycle.onResume()     // delegate to SceneView owner
-    override fun pause() = lifecycle.onPause()
-    override fun close() = lifecycle.onClose()
+    override fun resume() { assertThread(); lifecycle.onResume() }     // delegate to SceneView owner
+    override fun pause() { assertThread(); lifecycle.onPause() }
+    override fun close() { assertThread(); cached = null; cachedId = -1; lifecycle.onClose() }   // drop cached frame state
 
     override fun latestFrame(): ArFrameRef? {
         assertThread()
-        return cached?.let { ArCoreFrame(it, session, registry, cachedId, basisRevision, imageTransform, geomW, geomH) }
+        return cached?.let { ArCoreFrame(it, session, registry, cachedId, basisRevision, imageTransform, geomW, geomH, ::assertThread) }
     }
 
     override fun acquireSnapshot(): FrameSnapshot? {
@@ -410,7 +430,7 @@ class ArCoreSession(
         val frame = cached ?: return null
         if (cachedId == snapshotTakenForId) return null                 // at most one snapshot per frame
         if (frame.camera.trackingState != TrackingState.TRACKING) return null
-        val rec = ArCoreFrame(frame, session, registry, cachedId, basisRevision, imageTransform, geomW, geomH).record
+        val rec = ArCoreFrame(frame, session, registry, cachedId, basisRevision, imageTransform, geomW, geomH, ::assertThread).record
         val img = try { frame.acquireCameraImage() } catch (e: NotYetAvailableException) { return null }
         try {
             val p = img.planes   // Y, U, V
