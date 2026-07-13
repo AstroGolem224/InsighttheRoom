@@ -18,7 +18,7 @@ data class DetectorPoint(val nx: Double, val ny: Double) {
  * canonicalization itself is Plan 3b's adapter contract; here we just require it was done.)
  */
 internal fun ImageTransform.validate(k: CameraIntrinsics) {
-    require(displayRotationDeg == 0) { "v1 needs a canonical upright image (displayRotationDeg=0); got $displayRotationDeg" }
+    require(displayRotationDeg == 0) { "v1 uses the raw unrotated image with identity rotation (displayRotationDeg=0); got $displayRotationDeg" }
     require(sourceWidth > 0 && sourceHeight > 0 && cropWidth > 0 && cropHeight > 0 && detectorWidth > 0 && detectorHeight > 0) { "non-positive dimension" }
     // Long arithmetic so cropLeft+cropWidth can't Int-overflow past the bound
     require(cropLeft >= 0 && cropTop >= 0 &&
