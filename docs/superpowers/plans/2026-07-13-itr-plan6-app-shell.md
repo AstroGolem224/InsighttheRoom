@@ -144,7 +144,7 @@ fun homeRow(building: Building, units: Units): HomeRow {
 - Create: `app/build.gradle.kts`
 - Create: `app/src/main/AndroidManifest.xml`
 - Create: `app/src/main/res/xml/data_extraction_rules.xml`, `backup_rules.xml`
-- Create: `app/src/main/res/values/themes.xml` — an app theme `Theme.InsightTheRoom` (parent `Theme.Material3.DayNight.NoActionBar`; requires the `compose-material3` dep). The manifest references THIS theme, not an assumed framework one.
+- Create: `app/src/main/res/values/themes.xml` — an app theme `Theme.InsightTheRoom` with parent `Theme.Material3.DayNight.NoActionBar`, which comes from the **Material Components** library, NOT compose-material3. So add `com.google.android.material:material:1.12.0` to the app's dependencies + catalog (`material-components = { module = "com.google.android.material:material", version = "1.12.0" }`). The manifest references THIS theme.
 - Create: `app/src/main/kotlin/itr/app/ItrApp.kt` (Hilt `@HiltAndroidApp`)
 - Modify: `settings.gradle.kts`, `gradle/libs.versions.toml`
 
@@ -177,7 +177,7 @@ App `testImplementation`: `robolectric`, `junit4`, `androidx-test-core`, `kotlin
 
 - [ ] **Step 2: `app/build.gradle.kts`** — `com.android.application`, namespace `itr.app`, applicationId `com.itr`, compileSdk 35 / minSdk 26 / targetSdk 35, Compose (compose-compiler plugin), Hilt (KSP), depends on ALL modules. `testOptions { unitTests.isIncludeAndroidResources = true }`.
 
-- [ ] **Step 3: `AndroidManifest.xml`** — the security spine. **NO `<uses-permission android:name="android.permission.INTERNET"/>`.** Declares `android:name=".ItrApp"`, `allowBackup="false"`, `fullBackupContent="@xml/backup_rules"`, `dataExtractionRules="@xml/data_extraction_rules"`, ARCore `meta-data required`, `uses-feature camera.ar required`, the launcher Activity (`.MainActivity`, a `ComponentActivity` host). CAMERA permission only.
+- [ ] **Step 3: `AndroidManifest.xml`** — the security spine. **TDD: write Task 6's `NoNetworkTest` FIRST and run it against a manifest WITHOUT the `tools:node="remove"` lines → it FAILS (SceneView's AAR contributes INTERNET) → then add the removal lines below → green.** **NO `<uses-permission android:name="android.permission.INTERNET"/>` (only the removal).** Declares `android:name=".ItrApp"`, `allowBackup="false"`, `fullBackupContent="@xml/backup_rules"`, `dataExtractionRules="@xml/data_extraction_rules"`, ARCore `meta-data required`, `uses-feature camera.ar required`, the launcher Activity (`.MainActivity`, a `ComponentActivity` host). CAMERA permission only.
 
 ```xml
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -201,7 +201,7 @@ App `testImplementation`: `robolectric`, `junit4`, `androidx-test-core`, `kotlin
 </manifest>
 ```
 
-- [ ] **Step 4: Backup rules** — exclude EVERYTHING (not selected files), so nothing is ever eligible for cloud backup or device-transfer even if an OEM path applies the rules. `backup_rules.xml`: `<full-backup-content><exclude domain="root" path="."/><exclude domain="file" path="."/><exclude domain="database" path="."/><exclude domain="sharedpref" path="."/></full-backup-content>`. `data_extraction_rules.xml`: same `<exclude .../>` set under both `<cloud-backup>` and `<device-transfer>`. Belt-and-suspenders with `allowBackup="false"`.
+- [ ] **Step 4: Backup rules** — exclude EVERYTHING across ALL domains (credential- and device-protected + external), so nothing is ever eligible even if an OEM/platform path applies the rules. `backup_rules.xml` (legacy) `<full-backup-content>`: `<exclude>` for `domain` = `root`, `file`, `database`, `sharedpref`, `external`, `device_root`, `device_file`, `device_database`, `device_sharedpref`, each `path="."`. `data_extraction_rules.xml`: the SAME full `<exclude .../>` set under BOTH `<cloud-backup>` and `<device-transfer>`. Belt-and-suspenders with `allowBackup="false"`.
 
 - [ ] **Step 5: Commit** — `chore(app): application module + no-INTERNET / no-backup manifest`.
 
@@ -236,18 +236,19 @@ import kotlin.test.assertEquals
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class SettingsRepositoryTest {
-    private fun store(name: String): DataStore<Preferences> {
-        val ctx = ApplicationProvider.getApplicationContext<android.content.Context>()
-        return PreferenceDataStoreFactory.create { File(ctx.cacheDir, "$name.preferences_pb") }
-    }
+    private fun file() = File(ApplicationProvider.getApplicationContext<android.content.Context>().cacheDir,
+        "settings-${System.nanoTime()}.preferences_pb")   // unique per test run
 
-    @Test fun `defaults, then a change persists across a fresh repository over the same store`() = runTest {
-        val ds = store("settings-test")
-        val repo = SettingsRepository(ds)
+    @Test fun `defaults, then a change persists to disk (reopened via a fresh DataStore)`() = runTest {
+        val f = file()
+        val scope1 = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Job())
+        val ds1 = PreferenceDataStoreFactory.create(scope = scope1) { f }
+        val repo = SettingsRepository(ds1)
         assertEquals(AppSettings.DEFAULT, repo.get())
         repo.setUnits(Units.IMPERIAL); repo.setSnap(false); repo.setDiagnosticLog(true)
-        val reopened = SettingsRepository(ds)   // same store, new repo instance
-        assertEquals(AppSettings(Units.IMPERIAL, snapByDefault = false, diagnosticLog = true), reopened.get())
+        scope1.cancel()                                     // close the first DataStore over this file
+        val ds2 = PreferenceDataStoreFactory.create { f }   // reopen the SAME file with a new DataStore
+        assertEquals(AppSettings(Units.IMPERIAL, snapByDefault = false, diagnosticLog = true), SettingsRepository(ds2).get())
     }
 }
 ```
@@ -281,6 +282,7 @@ import itr.core.model.Building
 interface ScanStore {                       // the app-side seam; Hilt provides an adapter over ScanRepository
     suspend fun list(): List<Building>
     suspend fun load(id: String): Building?
+    suspend fun save(building: Building)     // Detail marker edits persist through this
     suspend fun delete(id: String)
 }
 ```
@@ -307,28 +309,35 @@ class HomeViewModelTest {
     private class FakeStore(var buildings: List<Building>) : ScanStore {
         override suspend fun list() = buildings
         override suspend fun load(id: String) = buildings.firstOrNull { it.id == id }
+        override suspend fun save(building: Building) { buildings = buildings.filterNot { it.id == building.id } + building }
         override suspend fun delete(id: String) { buildings = buildings.filterNot { it.id == id } }
     }
+    private class FakeSettings(var units: Units) : SettingsSource { override suspend fun units() = units }
 
-    @Test fun `refresh loads rows in the chosen units and reflects a newly-saved scan`() = runTest {
+    @Test fun `the ViewModel refresh() publishes rows and reflects a newly-saved scan`() = runTest {
         val store = FakeStore(listOf(building("a")))
-        assertEquals(listOf("4.00 m²"), loadHomeRows(store.list(), Units.METRIC).map { it.areaText })
-        store.buildings = store.buildings + building("b", obj = true)   // returned from a scan
-        val rows = loadHomeRows(store.list(), Units.METRIC)
-        assertEquals(2, rows.size); assertEquals(1, rows[1].objectCount)
+        val vm = HomeViewModel(store, FakeSettings(Units.METRIC))
+        vm.refresh(); runCurrent()
+        assertEquals(listOf("4.00 m²"), vm.rows.value.map { it.areaText })
+        store.buildings = store.buildings + building("b", obj = true)
+        vm.refresh(); runCurrent()
+        assertEquals(2, vm.rows.value.size); assertEquals(1, vm.rows.value[1].objectCount)
     }
 
-    @Test fun `switching units remaps the same buildings`() = runTest {
-        val store = FakeStore(listOf(building("a")))
-        assertEquals("43.06 ft²", loadHomeRows(store.list(), Units.IMPERIAL).first().areaText)   // 4 m²
+    @Test fun `switching units remaps on the next refresh`() = runTest {
+        val store = FakeStore(listOf(building("a"))); val settings = FakeSettings(Units.METRIC)
+        val vm = HomeViewModel(store, settings); vm.refresh(); runCurrent()
+        assertEquals("4.00 m²", vm.rows.value.first().areaText)
+        settings.units = Units.IMPERIAL; vm.refresh(); runCurrent()
+        assertEquals("43.06 ft²", vm.rows.value.first().areaText)   // 4 m²
     }
 }
 ```
-(`loadHomeRows(buildings, units) = buildings.map { homeRow(it, units) }` — the pure helper.)
+> `HomeViewModel(store: ScanStore, settings: SettingsSource)` — `SettingsSource` is a tiny interface (`suspend fun units(): Units`) the real `SettingsRepository` implements, so the VM is faked without Android. `refresh()` = `_rows.value = loadHomeRows(store.list(), settings.units())`; `rows` is the read-only `StateFlow`. Import `kotlinx.coroutines.test.runCurrent`. `loadHomeRows(buildings, units) = buildings.map { homeRow(it, units) }` is the pure helper.
 
-- [ ] **Step 2: Run red, implement** `loadHomeRows` + `HomeViewModel` (`@HiltViewModel`, injects `ScanStore` + `SettingsRepository`): exposes `val rows: StateFlow<List<HomeRow>>`; a `fun refresh()` that reads `store.list()` + current `settings.units` and maps via `loadHomeRows`; the Home screen calls `refresh()` from a `LaunchedEffect` on the nav back-stack entry's `RESUMED` state so a scan saved and popped back re-loads the list (`listBuildings` is one-shot suspend — refresh-on-resume is the v1 trigger; a Room `Flow` is a v2 nicety). Also provide the `ScanStore` adapter: `class ScanRepositoryStore(private val repo: ScanRepository): ScanStore { override suspend fun list() = repo.listBuildings(); override suspend fun load(id) = repo.loadBuilding(id); override suspend fun delete(id) = repo.deleteBuilding(id) }`.
+- [ ] **Step 2: Run red, implement** `loadHomeRows` + `HomeViewModel(store: ScanStore, settings: SettingsSource)` (exposes `val rows: StateFlow<List<HomeRow>>`; `fun refresh()` = `_rows.value = loadHomeRows(store.list(), settings.units())`). `SettingsSource` (`suspend fun units(): Units`) is implemented by `SettingsRepository`. The Home screen calls `refresh()` via **`LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refresh() }`** (a plain `LaunchedEffect` reading `currentState` would NOT rerun on resume) so a scan saved and popped back re-loads (v1 trigger; a Room `Flow` is v2). `ScanStore` adapter (with `save`): `class ScanRepositoryStore(private val repo: ScanRepository): ScanStore { override suspend fun list() = repo.listBuildings(); override suspend fun load(id) = repo.loadBuilding(id); override suspend fun save(b) = repo.saveBuilding(b); override suspend fun delete(id) = repo.deleteBuilding(id) }`.
 
-- [ ] **Step 3: Assisted factories + route-scoped lifecycle** (fixes the circular AR construction). `ScanWizardScreen` OWNS the `ARSceneView`: it creates the view, obtains its live `Session`, then builds the controller via an **assisted** `ScanControllerFactory.create(session, lifecycle, imageTransform)` (which internally creates one `Detector` and one `ArCoreSession` for this scan). A `DisposableEffect(Unit)` on the route calls `controller.destroy()` (→ `pipeline.shutdown()` + close the `Detector`) and destroys the `ARSceneView` on dispose; `onFrame`/`onDisplayGeometry` are forwarded from the SceneView callbacks; `LifecycleEventObserver` forwards pause/resume to `controller` (background = pause, not destroy). Nothing AR-related is a Hilt singleton.
+- [ ] **Step 3: Assisted factories + route-scoped lifecycle** (fixes the circular AR construction; **also MODIFY `feature-scan/.../ScanWizardScreen.kt`** to take a factory lambda, not a pre-built controller — an app-owned factory can't be referenced from `:feature-scan` without a dependency cycle). `ScanWizardScreen(createController: (Session, SessionLifecycle) -> ScanController, …)` OWNS the `ARSceneView`: creates the view, and only once the first `onSessionUpdated` supplies a live `Session` does it build the controller via `createController(session, lifecycle)` (a nullable `controller` state until then). The `:app` scan route passes `createController = { s, lc -> scanControllerFactory.create(s, lc, UnrotatedFullImageTransform) }`. **Controller lifecycle explicitly drives the session:** `onBackground` → `arSession.pause()`, `onForeground` → `arSession.resume()`, `destroy` → `arSession.close()` (these delegate to the wired `SessionLifecycle` which pauses/resumes/destroys the ARSceneView — the ONE owner, no double-close). A `LifecycleEventObserver` forwards ON_PAUSE/ON_RESUME to the controller (background = pause, NOT destroy). A `DisposableEffect(Unit)` on the route calls `controller.destroy()` on dispose. **`destroy()` must not block the UI thread:** `pipeline.shutdown()` + the detector-executor shutdown run **without `awaitTermination` on the caller** (fire the executor `shutdownNow()`/close on the background executor itself); only the thread-confined AR/view cleanup stays on the UI callback. Nothing AR-related is a Hilt singleton.
 
 - [ ] **Step 4: Navigation + screens** — `Nav.kt` NavHost routes with concrete ViewModels:
   - `home` → `HomeViewModel` (rows StateFlow); cards → `detail/{id}`, FAB → `scan`.
