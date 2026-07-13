@@ -181,6 +181,9 @@ fun yuvToRgba(
     require(width.toLong() * height <= Int.MAX_VALUE / 4L) { "image too large" }
     // required buffer extents computed in Long so they can't overflow before the bounds check
     val cw = (width + 1) / 2; val ch = (height + 1) / 2   // 4:2:0 chroma dims (ceil)
+    // strides must span a full row (else logical rows overlap while still passing the size checks)
+    require(yRowStride.toLong() >= width) { "yRowStride < width (rows overlap)" }
+    require(uvRowStride.toLong() >= (cw - 1).toLong() * uvPixelStride + 1) { "uvRowStride too small for the chroma row" }
     require(y.size.toLong() >= (height - 1).toLong() * yRowStride + width) { "Y buffer too small for stride" }
     val uvNeed = (ch - 1).toLong() * uvRowStride + (cw - 1).toLong() * uvPixelStride + 1
     require(u.size.toLong() >= uvNeed && v.size.toLong() >= uvNeed) { "U/V buffer too small for stride" }
@@ -252,19 +255,23 @@ import itr.core.ar.Pose as ArPose
 import itr.core.ar.Quaternion
 import itr.core.geometry.Vec3
 
-class ArCorePlane(private val plane: ArcPlane, private val registry: PlaneRegistry) : ArPlaneRef {
-    override val id: String get() = registry.idFor(plane)   // equality-keyed: same native handle -> same id
-    override val type: PlaneType get() = when (plane.type) {
+class ArCorePlane(
+    private val plane: ArcPlane,
+    private val registry: PlaneRegistry,
+    private val assertThread: () -> Unit,   // guards escaped ArPlaneRef getters (registry + ARCore access)
+) : ArPlaneRef {
+    override val id: String get() { assertThread(); return registry.idFor(plane) }   // equality-keyed: same handle -> same id
+    override val type: PlaneType get() { assertThread(); return when (plane.type) {
         ArcPlane.Type.HORIZONTAL_UPWARD_FACING -> PlaneType.HORIZONTAL_UP
         ArcPlane.Type.HORIZONTAL_DOWNWARD_FACING -> PlaneType.HORIZONTAL_DOWN
         else -> PlaneType.VERTICAL
-    }
-    override val centerY: Double get() = plane.centerPose.ty().toDouble()
-    override val boundingAreaM2: Double get() = (plane.extentX * plane.extentZ).toDouble()
-    override val isTracking: Boolean get() = plane.trackingState == TrackingState.TRACKING
-    override val centerPose: ArPose get() = plane.centerPose.toAr()
-    override val normal: Vec3 get() { val f = FloatArray(3); plane.centerPose.getTransformedAxis(1, 1f, f, 0); return Vec3(f[0].toDouble(), f[1].toDouble(), f[2].toDouble()) }  // Y axis = plane normal
-    override val subsumedBy: ArPlaneRef? get() = plane.subsumedBy?.let { ArCorePlane(it, registry) }
+    } }
+    override val centerY: Double get() { assertThread(); return plane.centerPose.ty().toDouble() }
+    override val boundingAreaM2: Double get() { assertThread(); return (plane.extentX * plane.extentZ).toDouble() }
+    override val isTracking: Boolean get() { assertThread(); return plane.trackingState == TrackingState.TRACKING }
+    override val centerPose: ArPose get() { assertThread(); return plane.centerPose.toAr() }
+    override val normal: Vec3 get() { assertThread(); val f = FloatArray(3); plane.centerPose.getTransformedAxis(1, 1f, f, 0); return Vec3(f[0].toDouble(), f[1].toDouble(), f[2].toDouble()) }  // Y axis = plane normal
+    override val subsumedBy: ArPlaneRef? get() { assertThread(); return plane.subsumedBy?.let { ArCorePlane(it, registry, assertThread) } }   // propagate the guard
 }
 
 internal fun com.google.ar.core.Pose.toAr(): ArPose {
@@ -329,7 +336,7 @@ class ArCoreFrame(
     override val trackingOk: Boolean get() { assertThread(); return frame.camera.trackingState == TrackingState.TRACKING }
     override fun currentPlanes(): List<ArPlaneRef> {
         assertThread()
-        return session.getAllTrackables(ArcPlane::class.java).map { ArCorePlane(it, registry) }   // full current set
+        return session.getAllTrackables(ArcPlane::class.java).map { ArCorePlane(it, registry, assertThread) }   // full current set
     }
     override fun hitTest(point: DisplayPoint): Pair<ArPlaneRef, Vec3>? {
         assertThread()
@@ -342,7 +349,7 @@ class ArCoreFrame(
             val tr = h.trackable
             if (tr is ArcPlane && tr.isPoseInPolygon(h.hitPose)) {
                 val t = h.hitPose.translation
-                return ArCorePlane(tr, registry) to Vec3(t[0].toDouble(), t[1].toDouble(), t[2].toDouble())
+                return ArCorePlane(tr, registry, assertThread) to Vec3(t[0].toDouble(), t[1].toDouble(), t[2].toDouble())
             }
         }
         return null
