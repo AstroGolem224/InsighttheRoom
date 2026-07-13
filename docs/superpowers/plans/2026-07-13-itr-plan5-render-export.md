@@ -240,7 +240,11 @@ class DisplayListTest {
             listOf(Vec2(0.0,0.0), Vec2(3.0,0.0), Vec2(3.0,3.0), Vec2(2.0,3.0), Vec2(2.0,1.0), Vec2(1.0,1.0), Vec2(1.0,3.0), Vec2(0.0,3.0)),
             emptyList(), snapped = false)
         val at = buildDisplayList(u, Units.METRIC).commands.filterIsInstance<DrawCmd.AreaLabel>().first().at
+        // STRICTLY interior: the point and a tiny neighbourhood around it are all inside (not on a wall)
         assertTrue(itr.core.geometry.pointInPolygon(at, u.corners))
+        val e = 1e-4
+        assertTrue(listOf(Vec2(at.x+e,at.z), Vec2(at.x-e,at.z), Vec2(at.x,at.z+e), Vec2(at.x,at.z-e))
+            .all { itr.core.geometry.pointInPolygon(it, u.corners) })
     }
 
     @Test fun `bounds enclose corners AND markers`() {
@@ -310,9 +314,11 @@ fun sanitizeLabel(s: String): String {
 class RenderTransform(private val dl: DisplayList, val pxPerMetre: Double, val pad: Double = RenderStyle.paddingPx.toDouble()) {
     init {
         require(pxPerMetre.isFinite() && pxPerMetre > 0) { "pxPerMetre must be finite and > 0" }
+        require(pad.isFinite() && pad >= 0.0) { "pad must be finite and >= 0" }
         dl.validateForRender()
         val wD = (dl.boundsMax.x - dl.boundsMin.x) * pxPerMetre + 2 * pad
         val hD = (dl.boundsMax.z - dl.boundsMin.z) * pxPerMetre + 2 * pad
+        require(wD.isFinite() && hD.isFinite() && wD > 0 && hD > 0) { "non-positive render dimensions" }
         require(wD <= MAX_DIM && hD <= MAX_DIM) { "render dimensions too large: ${wD}x${hD} (max $MAX_DIM)" }
     }
     private fun q(v: Double) = kotlin.math.round(v * 10.0) / 10.0   // 0.1 px quantum, shared by all renderers
@@ -341,18 +347,32 @@ fun DisplayList.validateForRender() {
 // enforce sanitize-once: a directly-constructed DisplayList with a raw/illegal/oversized label is rejected
 private fun requireSanitized(label: String) = require(label == sanitizeLabel(label)) { "label not sanitized: renderers require sanitizeLabel()" }
 
-/** A point guaranteed strictly inside a simple polygon: the shoelace centroid, else the first
- *  triangle-centroid of a consecutive vertex triple that lies inside (a concave-safe fallback). */
+/** Strictly inside = inside AND not on any edge (a boundary point overlaps a wall — unsuitable). */
+private fun strictlyInside(p: Vec2, poly: List<Vec2>): Boolean {
+    if (!pointInPolygon(p, poly)) return false
+    val n = poly.size
+    for (i in 0 until n) {
+        val a = poly[i]; val b = poly[(i + 1) % n]
+        val cross = (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x)
+        if (kotlin.math.abs(cross) < 1e-9 &&
+            p.x in (minOf(a.x, b.x) - 1e-9)..(maxOf(a.x, b.x) + 1e-9) &&
+            p.z in (minOf(a.z, b.z) - 1e-9)..(maxOf(a.z, b.z) + 1e-9)) return false   // on edge
+    }
+    return true
+}
+
+/** A point STRICTLY inside a simple polygon: shoelace centroid, else the first consecutive-triple
+ *  triangle-centroid that is strictly interior (concave-safe; never lands on a wall). */
 fun interiorLabelPoint(corners: List<Vec2>): Vec2 {
     val c = polygonCentroid(corners)
-    if (pointInPolygon(c, corners)) return c
+    if (strictlyInside(c, corners)) return c
     val n = corners.size
     for (i in 0 until n) {
         val a = corners[i]; val b = corners[(i + 1) % n]; val d = corners[(i + 2) % n]
         val tri = Vec2((a.x + b.x + d.x) / 3, (a.z + b.z + d.z) / 3)
-        if (pointInPolygon(tri, corners)) return tri
+        if (strictlyInside(tri, corners)) return tri
     }
-    return c   // degenerate; caller's polygon was already validated so this is unreachable in practice
+    return c   // caller's polygon was validated non-degenerate; unreachable in practice
 }
 
 /** Build the single display list every renderer/exporter consumes. Empty for an invalid plan. */
@@ -475,6 +495,16 @@ class SvgTest {
     @Test fun `invalid scale or reversed bounds are rejected`() {
         assertFailsWith<IllegalArgumentException> { toSvg(dl(), pxPerMetre = 0.0) }
         assertFailsWith<IllegalArgumentException> { toSvg(DisplayList(emptyList(), Vec2(5.0,0.0), Vec2(0.0,0.0))) }  // max<min
+    }
+
+    @Test fun `SVG coordinates equal the shared RenderTransform values (parity invariant)`() {
+        // every renderer maps through the same RenderTransform; prove SVG emits exactly its numbers.
+        val d = dl()
+        val t = itr.core.render.RenderTransform(d, 100.0)
+        val wall = d.commands.filterIsInstance<DrawCmd.Wall>().first()
+        val svg = toSvg(d, 100.0)
+        val expectedX1 = String.format(Locale.US, "%.1f", t.x(wall.a.x))
+        assertTrue(svg.contains("x1=\"$expectedX1\""))   // SVG uses the shared transform, not its own math
     }
 }
 ```
@@ -761,7 +791,7 @@ fun renderPng(dl: DisplayList, pxPerMetre: Float = 100f): Bitmap {
     fun x(v: Double) = t.x(v).toFloat(); fun y(v: Double) = t.y(v).toFloat()
     val wall = Paint().apply { color = RenderStyle.wallArgb.toInt(); strokeWidth = RenderStyle.strokeWidthPx }
     val mark = Paint().apply { color = RenderStyle.markerArgb.toInt() }
-    // single bundled font family shared with SVG (font-family="sans-serif") for consistent glyphs
+    // shared generic sans-serif family (matches SVG font-family="sans-serif"); v1 uses the platform generic
     fun paint(px: Float, center: Boolean = false) = Paint().apply {
         color = Color.BLACK; textSize = px; typeface = Typeface.SANS_SERIF
         textAlign = if (center) Paint.Align.CENTER else Paint.Align.LEFT
@@ -785,7 +815,7 @@ fun renderPngBytes(dl: DisplayList, pxPerMetre: Float = 100f): ByteArray {
 }
 ```
 
-- [ ] **Step 4: Write the sharing helper** (`Sharing.kt`) — traversal-guarded, TTL-vs-now, ClipData
+- [ ] **Step 4: Write the failing `SharingTest` FIRST (TDD)** — the test code is in Step 5 below; create it now, run `./gradlew :export-android:testDebugUnitTest --tests "itr.export.android.SharingTest"` → FAIL (unresolved `shareExport`), THEN write `Sharing.kt` (traversal-guarded, TTL-vs-now, ClipData, MIME-from-extension) and re-run → PASS.
 
 ```kotlin
 package itr.export.android
