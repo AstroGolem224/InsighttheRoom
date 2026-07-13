@@ -1004,10 +1004,11 @@ data class DetectorPoint(val nx: Double, val ny: Double) {
 }
 
 /**
- * Validate a transform + intrinsics can produce a well-defined ray. FrameRecord describes a
- * CANONICAL UPRIGHT camera image: Plan 4 / Plan 3b pre-rotate the raw sensor image to upright and
- * transform intrinsics/crop/mirror to match, so v1 only accepts displayRotationDeg=0. (The
- * canonicalization itself is Plan 3b's adapter contract; here we just require it was done.)
+ * Validate a transform + intrinsics can produce a well-defined ray. **v1 canonical image (clarified
+ * 2026-07-13): the RAW UNROTATED CPU camera image** — the detector consumes it directly and the box
+ * bottom-center is in that same unrotated normalized space, so displayRotationDeg is 0 (identity
+ * transform). Rotated-orientation support (pre-rotate pixels + transform intrinsics + per-rotation
+ * golden calibration) is a v2 item. The `require(displayRotationDeg == 0)` below IS that v1 contract.
  */
 internal fun ImageTransform.validate(k: CameraIntrinsics) {
     require(displayRotationDeg == 0) { "v1 needs a canonical upright image (displayRotationDeg=0); got $displayRotationDeg" }

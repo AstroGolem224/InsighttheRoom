@@ -240,12 +240,14 @@ class MarkerTrackerTest {
         assertEquals(1, t.markers().size); assertEquals("Couch", t.markers().first().label)
     }
 
-    @Test fun `a manually moved marker is not dragged back by later auto detections`() {
+    @Test fun `a manually moved marker keeps its display position AND still associates (no duplicate)`() {
         val t = MarkerTracker()
         t.observeFrame(listOf(obs("tv", 0.1, 0.0, 0.8))); val id = firstId(t); t.confirm(id)
-        t.move(id, Vec2(0.5,0.5))
-        t.observeFrame(listOf(obs("tv", 0.11, 0.0, 0.9)))   // associates but must NOT move the locked position
-        assertEquals(Vec2(0.5,0.5), t.markers().first().position)
+        t.move(id, Vec2(0.5,0.5))                            // display locked; autoPosition stays ~ (0,1)
+        t.observeFrame(listOf(obs("tv", 0.11, 0.0, 0.9)))   // near the AUTO position -> associates, no new track
+        assertEquals(1, t.candidates().size)                // NOT duplicated
+        assertTrue(t.objectsResolved())
+        assertEquals(Vec2(0.5,0.5), t.markers().first().position)   // display position unchanged
         assertTrue(t.candidates().first().manualPosition)
     }
 
@@ -295,69 +297,83 @@ data class Observation(val detectedClass: String, val box: BoundingBox, val posi
     init {
         require(detectedClass.isNotBlank()) { "blank class" }
         require(position.x.isFinite() && position.z.isFinite()) { "non-finite position" }
-        require(confidence.isFinite() && confidence in 0.0..1.0) { "confidence out of [0,1]" }
+        require(confidence.isFinite() && confidence > 0.0 && confidence <= 1.0) { "confidence must be in (0,1]" }  // >0: no zero-weight
     }
 }
 enum class MarkerState { CANDIDATE, CONFIRMED }
 data class TrackedMarker(val id: Long, val detectedClass: String, val displayLabel: String, val position: Vec2, val confidence: Double, val state: MarkerState, val observations: Int, val manualPosition: Boolean)
 
 /**
- * One-to-one multi-object tracker. Each frame is a BATCH: observeFrame greedily assigns each
- * detection to at most one existing SAME-class track (highest IoU ≥ [iouThreshold], gated by
- * [maxAssocM]); each track takes at most one detection per frame; unmatched detections become new
- * CANDIDATE tracks. The tracked position is a confidence-weighted estimate UNLESS the user moved the
- * marker (manualPosition), in which case auto-updates stop until the position is edited again.
- * markers() returns only CONFIRMED tracks. objectsResolved() = no CANDIDATE remains.
+ * Multi-object tracker. observeFrame processes a whole frame as a BATCH with a deterministic
+ * best-edge bipartite matching: build every eligible (track,detection) edge of the SAME class
+ * (IoU ≥ [iouThreshold], AUTO-position within [maxAssocM]), assign greedily by (IoU desc, distance
+ * asc, id) with each track+detection used once; unmatched detections become new CANDIDATE tracks.
+ * A track keeps TWO positions: [autoPosition] (confidence-weighted, used for association) and the
+ * displayed/persisted position (== auto until the user move()s it, then locked). markers() returns
+ * only CONFIRMED tracks at the DISPLAY position. objectsResolved() = no CANDIDATE remains.
  */
 class MarkerTracker(private val iouThreshold: Double = 0.3, private val maxAssocM: Double = 0.5) {
     init { require(iouThreshold.isFinite() && iouThreshold in 0.0..1.0 && maxAssocM.isFinite() && maxAssocM > 0) { "bad thresholds" } }
-    private class Track(val id: Long, val detectedClass: String, var displayLabel: String,
-                        var lastBox: BoundingBox, var position: Vec2, var confidence: Double,
+    private class Track(val id: Long, val detectedClass: String, var displayLabel: String, var lastBox: BoundingBox,
+                        var autoPosition: Vec2, var displayPosition: Vec2, var confidence: Double,
                         var state: MarkerState, var observations: Int, var wSum: Double, var manual: Boolean)
     private val tracks = mutableListOf<Track>()
     private var counter = 0L
 
-    /** Process one frame's detections as a batch; each track takes at most one detection. */
     fun observeFrame(observations: List<Observation>) {
-        val taken = HashSet<Long>()
-        // deterministic order: highest-confidence detections claim their best track first
-        for (o in observations.sortedWith(compareByDescending<Observation> { it.confidence }.thenBy { it.box.left })) {
-            val match = tracks.filter { it.id !in taken && it.detectedClass == o.detectedClass &&
-                    (it.position - o.position).length() <= maxAssocM && it.lastBox.iou(o.box) >= iouThreshold }
-                .maxWithOrNull(compareBy({ it.lastBox.iou(o.box) }, { -it.id }))
-            if (match != null) {
-                taken += match.id; match.lastBox = o.box; match.observations += 1
-                match.confidence = max(match.confidence, o.confidence)
-                if (!match.manual) {   // auto position only until the user overrides it
-                    val w = o.confidence
-                    match.position = Vec2((match.position.x * match.wSum + o.position.x * w) / (match.wSum + w),
-                                          (match.position.z * match.wSum + o.position.z * w) / (match.wSum + w))
-                    match.wSum += w
-                }
-            } else tracks += Track(counter++, o.detectedClass, o.detectedClass, o.box, o.position, o.confidence, MarkerState.CANDIDATE, 1, o.confidence, false)
+        // all eligible edges, ranked deterministically; greedy assignment (each track+detection once)
+        data class Edge(val track: Track, val obsIndex: Int, val iou: Double, val dist: Double)
+        val edges = ArrayList<Edge>()
+        observations.forEachIndexed { i, o ->
+            for (t in tracks) if (t.detectedClass == o.detectedClass) {
+                val iou = t.lastBox.iou(o.box); val dist = (t.autoPosition - o.position).length()
+                if (iou >= iouThreshold && dist <= maxAssocM) edges += Edge(t, i, iou, dist)
+            }
+        }
+        edges.sortWith(compareByDescending<Edge> { it.iou }.thenBy { it.dist }.thenBy { it.track.id }.thenBy { it.obsIndex })
+        val usedTracks = HashSet<Long>(); val usedObs = HashSet<Int>()
+        for (e in edges) {
+            if (e.track.id in usedTracks || e.obsIndex in usedObs) continue
+            usedTracks += e.track.id; usedObs += e.obsIndex
+            val o = observations[e.obsIndex]; val t = e.track
+            val w = o.confidence
+            t.autoPosition = Vec2((t.autoPosition.x * t.wSum + o.position.x * w) / (t.wSum + w),
+                                  (t.autoPosition.z * t.wSum + o.position.z * w) / (t.wSum + w))
+            t.wSum += w; t.observations += 1; t.lastBox = o.box; t.confidence = max(t.confidence, o.confidence)
+            if (!t.manual) t.displayPosition = t.autoPosition   // display follows auto until user override
+        }
+        observations.forEachIndexed { i, o ->
+            if (i !in usedObs) tracks += Track(counter++, o.detectedClass, o.detectedClass, o.box, o.position, o.position, o.confidence, MarkerState.CANDIDATE, 1, o.confidence, false)
         }
     }
 
     fun confirm(id: Long) { track(id)?.state = MarkerState.CONFIRMED }
     fun reject(id: Long) { tracks.removeAll { it.id == id } }
-    fun relabel(id: Long, label: String) { track(id)?.displayLabel = label }
-    fun move(id: Long, position: Vec2) { track(id)?.let { it.position = position; it.manual = true } }   // lock from auto-drift
-    /** Split off a new track at [at] with the same class/label (e.g. two merged objects). */
-    fun split(id: Long, at: Vec2): Long { val t = track(id) ?: return -1
-        val n = Track(counter++, t.detectedClass, t.displayLabel, t.lastBox, at, t.confidence, t.state, 1, t.wSum, true); tracks += n; return n.id }
-    /** Merge [drop] into [keep], combining observation history + confidence; classes must match. */
+    fun relabel(id: Long, label: String) { require(label.isNotBlank()) { "blank label" }; track(id)?.displayLabel = label }
+    /** User override: lock the DISPLAY position (association keeps using autoPosition, so no duplicate). */
+    fun move(id: Long, position: Vec2) { require(position.x.isFinite() && position.z.isFinite()) { "non-finite move" }; track(id)?.let { it.displayPosition = position; it.manual = true } }
+    /** Split off a distinct new track at [at] with the same class/label. */
+    fun split(id: Long, at: Vec2): Long { require(at.x.isFinite() && at.z.isFinite()) { "non-finite split" }
+        val t = track(id) ?: return -1; val n = Track(counter++, t.detectedClass, t.displayLabel, t.lastBox, at, at, t.confidence, t.state, 1, t.confidence, true); tracks += n; return n.id }
+    /** Merge [drop] into [keep] (same class): keep retains its display position/label/manual flag; the
+     *  auto estimate combines weighted, observations sum, confidence = max, state = the more-advanced. */
     fun merge(keep: Long, drop: Long) {
         val k = track(keep) ?: return; val d = track(drop) ?: return
         require(k.detectedClass == d.detectedClass) { "cannot merge different classes" }
-        k.observations += d.observations; k.confidence = max(k.confidence, d.confidence); tracks.remove(d)
+        val w = k.wSum + d.wSum
+        if (w > 0) k.autoPosition = Vec2((k.autoPosition.x * k.wSum + d.autoPosition.x * d.wSum) / w, (k.autoPosition.z * k.wSum + d.autoPosition.z * d.wSum) / w)
+        k.wSum = w; k.observations += d.observations; k.confidence = max(k.confidence, d.confidence)
+        if (d.state == MarkerState.CONFIRMED) k.state = MarkerState.CONFIRMED
+        if (!k.manual) k.displayPosition = k.autoPosition
+        tracks.remove(d)
     }
 
     fun candidates(): List<TrackedMarker> = tracks.map { it.view() }
-    fun objectsResolved(): Boolean = tracks.none { it.state == MarkerState.CANDIDATE }   // the FSM prerequisite
-    fun markers(): List<RoomObject> = tracks.filter { it.state == MarkerState.CONFIRMED }.map { RoomObject(it.displayLabel, it.position, it.confidence) }
+    fun objectsResolved(): Boolean = tracks.none { it.state == MarkerState.CANDIDATE }
+    fun markers(): List<RoomObject> = tracks.filter { it.state == MarkerState.CONFIRMED }.map { RoomObject(it.displayLabel, it.displayPosition, it.confidence) }
 
     private fun track(id: Long) = tracks.firstOrNull { it.id == id }
-    private fun Track.view() = TrackedMarker(id, detectedClass, displayLabel, position, confidence, state, observations, manual)
+    private fun Track.view() = TrackedMarker(id, detectedClass, displayLabel, displayPosition, confidence, state, observations, manual)
 }
 ```
 
@@ -519,16 +535,23 @@ package itr.core.scan
 import itr.core.geometry.RoomBasis
 import itr.core.geometry.Vec3
 import itr.core.geometry.buildFloorPlan
+import itr.core.geometry.pointInPolygon
 import itr.core.model.RoomObject
 import itr.core.model.ScanStatus
 import itr.core.model.ScannedRoom
 
-/** Assemble a ScannedRoom. COMPLETE iff finalized AND the polygon is valid (ceiling optional). */
+/** Assemble a ScannedRoom. COMPLETE iff finalized AND the polygon is valid (ceiling optional). Markers
+ *  are defensively dropped if non-finite or outside the room polygon (belt-and-suspenders vs the tracker). */
 fun assembleRoom(
     id: String, name: String, basis: RoomBasis, worldCorners: List<Vec3>, markers: List<RoomObject>,
     ceiling: CeilingMeasurement, snapped: Boolean, finalized: Boolean, createdAtEpochMs: Long,
 ): ScannedRoom {
-    val plan = buildFloorPlan(worldCorners.map { basis.toLocal(it) }, markers, snapped)
+    val localCorners = worldCorners.map { basis.toLocal(it) }
+    val validPoly = buildFloorPlan(localCorners, emptyList(), snapped).isValid
+    val kept = if (!validPoly) markers else markers.filter {
+        it.position.x.isFinite() && it.position.z.isFinite() && pointInPolygon(it.position, localCorners)
+    }
+    val plan = buildFloorPlan(localCorners, kept, snapped)
     val status = if (finalized && plan.isValid) ScanStatus.COMPLETE else ScanStatus.DRAFT
     return ScannedRoom(id, name, plan, ceiling.heightOrNull(), status, createdAtEpochMs)
 }
@@ -549,12 +572,14 @@ fun assembleRoom(
 
 - [ ] **Step 2: Model asset gate** — copy the Phase-0 `.tflite`; a build/test step asserts its SHA-256 == PHASE0.md before use.
 
-- [ ] **Step 3: `Detector.kt`** — a factory + mapping layer (NOT a bare TODO). Type: `data class Detection(val label: String, val normalizedBox: BoundingBox, val confidence: Double)` (box normalized to [0,1] in the unrotated image space; `placeDetection` derives the bottom-center from it). `DetectorFactory.create(context)` builds a MediaPipe `ObjectDetector` with the GPU delegate (CPU fallback if GPU init fails), score threshold (e.g. 0.4), max results, and the COCO allow-list (chair/couch/bed/dining table/tv/potted plant/refrigerator/…). `detect(image: CameraImage): List<Detection>` builds an `MPImage` from the RGBA bytes (`ByteBufferImageBuilder`, RGBA_8888, width×height), runs the detector, filters to the allow-list + threshold, and maps each result's pixel box to a normalized `BoundingBox(left/w, top/h, right/w, bottom/h)`. Closes the `MPImage`. The RGBA→MPImage + result mapping is device/runtime glue verified by the checklist; the box→bottom-center→world→room path is the JVM-tested pure core (Task 4).
+- [ ] **Step 3: `Detector.kt`** — a factory + mapping layer (NOT a bare TODO). Type: `data class Detection(val label: String, val normalizedBox: BoundingBox, val confidence: Double)` (box normalized to [0,1] in the unrotated image space; `placeDetection` derives the bottom-center from it). `DetectorFactory.create(context)` builds a MediaPipe `ObjectDetector` with the GPU delegate (CPU fallback if GPU init fails), score threshold (e.g. 0.4), max results, and the COCO allow-list (chair/couch/bed/dining table/tv/potted plant/refrigerator/…). `detect(image: CameraImage): List<Detection>` builds an `MPImage` from the RGBA bytes (`ByteBufferImageBuilder`, RGBA_8888, width×height), runs the detector, filters to the allow-list + threshold, and maps each result's pixel box to a normalized box, **clipping to [0,1] then skipping any degenerate box** (`coerceIn(0.0,1.0)` per edge; drop if `right<=left || bottom<=top`) so one malformed model box rejects only itself, never throwing for the whole frame. Closes the `MPImage`. The RGBA→MPImage + result mapping is device/runtime glue verified by the checklist; the box→bottom-center→world→room path is the JVM-tested pure core (Task 4).
 
 - [ ] **Step 4: `ScanController`** (the wiring; all state single-threaded on the AR frame thread):
   - Holds `ScanStage`, `FloorSelection` (+ its `RoomBasis`, locked after two eligible projected corners), the world corner taps, `MarkerTracker`, `FramePipeline`, `CeilingMeasurement`, a monotonically-increasing `basisRevision`.
   - **Corner tap:** `frame.hitTest(displayPoint)` → require `floorSelection.isHitEligible(hitPlane)` → **reject if the hit's signed distance to `floor.referencePlane` exceeds a named tolerance** (drift beyond the frozen plane) → project the hit onto `floor.referencePlane` → store the projected world point. Lock the `RoomBasis` once two eligible corners exist AND the projected first edge length ≥ the geometry min-edge (else keep tapping) — origin = first corner, normal = frozen reference normal, X = first→second projected edge.
-  - **Detection (async → marshalled onto the AR frame thread):** each AR frame, `acquireSnapshot()` → `if (pipeline.submit(snapshot.record))` **only then** hand the RGBA to `Detector.detect` on a worker; if `submit` returns false (backpressure/dup), discard the snapshot and create NO callback. When detect returns, **post the result list back to the AR frame thread**, then call `pipeline.completeApplying(snapshot.record.id) { rec -> results.mapNotNull { placeDetection(rec, it.label, it.normalizedBox, it.confidence, floor.referencePlane, basis, plan.rawCorners) } }` — exactly ONE completeApplying per record for the WHOLE list (never per-detection) → `tracker.observeFrame(observations)`. An EMPTY result completes normally through that same single call (an empty list is a successful inference, not a failure). `pipeline.fail(id)` / `pipeline.cancel(id)` are reserved for a THROWN or cancelled inference **before** completion. On a basis-defining edit: bump `basisRevision`, call `pipeline.onBasisRevised(basisRevision)` (stales all in-flight records — Plan 3's reusable API; NOT `shutdown()`), set `session.basisRevision = basisRevision` on the AR thread.
+  - **Detection (async → marshalled onto the AR frame thread via a queue):** worker completions are pushed to a thread-safe `ConcurrentLinkedQueue<PendingResult>` and **drained inside `onFrame`** (the exact adapter-bound AR frame thread — NOT `Handler(mainLooper)`, which may differ). Each AR frame: (1) drain the queue → for each pending, `pipeline.completeApplying(record.id) { rec -> results.mapNotNull { placeDetection(rec, it.label, it.normalizedBox, it.confidence, floor.referencePlane, basis, plan.rawCorners) } }` (exactly ONE completeApplying per record for the WHOLE list; an EMPTY result completes normally — an empty list is a successful inference, not a failure; `fail(id)`/`cancel(id)` only for a THROWN/cancelled inference before completion) → `tracker.observeFrame(observations)`. (2) `acquireSnapshot()` → `if (submissionsOpen && pipeline.submit(snapshot.record))` **only then** hand the RGBA to `Detector.detect` on a worker; if `submit` returns false (backpressure/dup) or submissions are closed, discard the snapshot and enqueue NO callback. On a basis-defining edit: bump `basisRevision`, `pipeline.onBasisRevised(basisRevision)` (stales all in-flight — Plan 3's reusable API, NOT `shutdown()`), set `session.basisRevision` on the AR thread.
+  - **OBJECTS → REVIEW gate (no late-candidate race):** close submissions, drain the queue + any accepted in-flight work on the AR thread, THEN evaluate `tracker.objectsResolved()` atomically; only advance if true. Reopen submissions if the user backs out to OBJECTS.
+  - **Shutdown (onDestroy/background):** on the AR thread, close submissions, `pipeline.shutdown()` (terminal), invalidate/ignore any queued worker completions, then close the MediaPipe `ObjectDetector` after the worker finishes.
   - **Basis edit → markers (v1 destructive reset):** editing a basis-defining corner **clears the markers and returns to OBJECTS unconfirmed, with a user confirmation** (see the PLAN amendment). Atomic old→new-basis marker rebasing is a v2 item.
   - **Confirm/edit:** the OBJECTS stage drives `tracker.confirm/reject/relabel/move/split/merge`; the FSM prerequisite `markersConfirmed` is `tracker.objectsResolved()` (no CANDIDATE remains) — never a free boolean.
   - **Finish:** `assembleRoom(..., markers = tracker.markers(), ceiling = ceilingMeasurement, finalized = true)` → wrap in a one-room `Building(id, name, listOf(room), now)` → `ScanRepository.saveBuilding(building)`.
