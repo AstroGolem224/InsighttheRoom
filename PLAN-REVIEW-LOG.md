@@ -324,3 +324,22 @@ Key: shared RenderTransform (quantized 0.1px, validated) used by SVG+PNG+Compose
 validateForRender enforces it; strictlyInside interior-label fallback; SVG-vs-transform parity invariant test;
 Locale.US throughout; MIME-from-extension sharing. Bundled-font pixel-text parity formally deferred to v2
 (PLAN.md render bullet amended).
+
+---
+
+# Plan 3b (ARCore adapter) — Codex review, 5 rounds → APPROVED
+Trajectory: 11 → 9 → 8 → 2 → 0.
+R1 (11): IdentityHashMap wrong for ARCore plane identity (native handle -> equality-keyed); adapter must
+NOT call session.update() (SceneView owns the loop) -> cache the forwarded frame; getAllTrackables not
+getUpdatedTrackables; YUV was a TODO (must be real testable code); availability UNKNOWN_CHECKING->Pending;
+setDisplayGeometry needed; module :arcore -> :core-arcore.
+R2 (9): imageTransform injection for Plan 4; lifecycle delegate not no-op; one id per cached frame; display
+geometry check on DisplayPoint; NotYetAvailableException package; hashCode-collision test; YUV overflow/stride
+tests; thread assertions.
+R3 (8): mandatory lifecycle/transform (no silent defaults) + named UnrotatedFullImageTransform; hitTest
+requires geometry set; rotation 0..3; assertThread callback into ArCoreFrame getters; assertThread on
+lifecycle + close clears cache; YUV Long bounds; pixel-stride test reads the 2nd sample.
+R4 (2): assertThread into ArCorePlane getters + subsumedBy; row-stride overlap guards.
+R5: APPROVED.
+Two pure pieces (equality PlaneRegistry, stride-aware yuvToRgba) are JVM-TDD'd in :core; the ARCore glue
+compiles + is runtime-verified via a DATED device checklist.
