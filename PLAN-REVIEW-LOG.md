@@ -152,3 +152,28 @@ Round 5 (1): degenerate validity lost in buildFloorPlan (empty issues → FloorP
 Round 6: **APPROVED** — DEGENERATE_AREA issue propagates; regression test added.
 
 All findings incorporated (none rejected). Result: correctness core is emulator-free TDD with adversarially-derived edge-case coverage.
+
+---
+
+# Act 3 — Build (Codex builds, Claude verifies)
+
+Reviewer/builder model: gpt-5.6-sol (config default). THREAD_ID 019f5a8f-9190-7172-9806-bf06a1eb91de.
+
+### Round 1 — Codex build
+Implemented Task 1 (Gradle skeleton) + Tasks 3–11 (pure-Kotlin core geometry + tests).
+Task 2 (Phase-0 device gate) deferred as instructed (needs a physical device; out of scope
+for the pure-core build). Report: 30 files created, `./gradlew :core:test` BUILD SUCCESSFUL,
+54 tests / 0 failures / 0 skipped. No Android/ARCore/MediaPipe/Compose/Hilt/Room deps added.
+
+### Claude's verdict — PASS (0 fix rounds needed)
+Verified independently:
+- Ran `./gradlew :core:test` myself → BUILD SUCCESSFUL, 54 tests green.
+- Read the diff. Correctness-critical files match the 6-round-approved plan verbatim:
+  RoomBasis zAxis = xAxis.cross(up).normalized() (the handedness fix), manhattanSnap with
+  input+output validation and angular+absolute+relative caps, FloorPlan computed walls/area
+  with internal constructor + defensive copies, validatePolygon emits DEGENERATE_AREA and
+  isValid excludes DEGENERATE winding.
+- Per-file @Test counts match the spec (54 total). No symbols renamed, no redesign.
+- No dependencies beyond Kotlin + JUnit5 + kotlin.test. grep hits for "android/arcore/..."
+  are prose comments only, not build deps.
+Clean build, faithful to spec, no scope creep. Ready for human sign-off.
