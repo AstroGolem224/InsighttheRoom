@@ -264,3 +264,51 @@ Verified independently:
 - Spot-checked: FramePipeline @Synchronized (10), projector finite guard, Plan-1 RoomBasis zAxis fix intact.
 - :core still has ZERO Android deps. :persistence / :spike untouched.
 Faithful to the 7-round-approved plan, clean, no scope creep.
+
+---
+
+# Plan 5 (render + export) — Codex review
+
+## Round 1 — Codex (VERDICT: REVISE) — 32 findings
+Key: Locale.US only in prose not code (numbers risk comma decimals -> invalid SVG); negative/NaN
+measurements undefined; imperial rollover fragile; ScaleBar absent from the "scale" contract; centroid
+= vertex-mean can fall outside concave rooms; non-finite marker positions reach output; renderer style
+divergence (green vs #1D9E75, 11px vs 22px); bounds ignore markers/labels; SVG control-char injection +
+no output-size cap on huge labels; renderPng returns a Bitmap, never PNG bytes for shareExport; Robolectric
+legacy Canvas may not rasterize (dark-pixel test unreliable) -> "no device" claim unsupported by that test;
+Sharing path-traversal in fileName, TTL compares to newest-file not now, no ClipData, untested; Compose
+compiler for Kotlin 2.0.21 needs the org.jetbrains.kotlin.plugin.compose plugin (not kotlinCompilerExtensionVersion);
+Task 5 TDD order inverted; missing snapped-geometry regression test.
+
+### Claude's response — accepting most; deferring font-measurement (#10) to v2
+Accepted: Locale.US inline everywhere + Locale.GERMANY test; finite/non-negative Units + validation;
+round-once imperial rollover; DrawCmd.ScaleBar; shoelace polygon centroid + fallback; reject non-finite
+markers; shared RenderStyle (colors/sizes both renderers consume); bounds include markers + margin;
+esc() strips XML-illegal control chars + label length cap; toSvg/renderPng param validation + ceil dims +
+max pixel guard; pngBytes() PNG compression + signature round-trip test; PngTest -> dims + PNG-signature
+(native graphics), degenerate test; Sharing basename+extension allowlist + canonical-parent traversal guard,
+TTL vs System.currentTimeMillis, ClipData grant, authority manifest placeholder + Robolectric sharing tests;
+Compose plugin org.jetbrains.kotlin.plugin.compose 2.0.21; catalog merge + core-ktx cataloged; Task 5 test-first.
+Rejected (Ponytail, v2): #10 bundled-font + per-renderer text-measurement adapters — geometry/style parity
+is structural via the shared display list; pixel-perfect cross-renderer TEXT parity needs screenshot infra and
+is not a v1 requirement.
+
+## Round 2 — Codex (VERDICT: REVISE) — 16 findings
+Parity-focused: shoelace-centroid can still fall outside very concave rooms (+ L-test doesn't prove the
+math since vertex-mean is on the boundary); snapped regression can pass without snapping; imperial scale
+bar labeled "3 ft 3 in" but 1 m long; area-label alignment differs (SVG middle vs PNG/Compose left); style
+not fully shared (radius, +6/+14 offsets); SVG caps labels but Compose/PNG don't -> different text; XML
+filter misses surrogates/U+FFFE/FFFF; SVG/PNG don't validate command coords; PNG test doesn't prove
+rasterization (white bitmap passes); PNG lengthM.toFloat before add; MIME not tied to extension; Sharing
+not test-first; bundled-font deferral conflicts with locked PLAN.md; no cross-renderer golden test.
+
+### Claude's response — PARTIALLY APPLIED (plan left in DRAFT; see the file's STATUS banner)
+Applied: shared RenderTransform (structural parity for coords + extents), sanitizeLabel ONCE in the display
+list (fixes SVG-only truncation + surrogate/noncharacter filtering), validateForRender (shared command
+validation), shoelace-centroid + best-effort inside fallback, imperial scale bar 0.3048 m labeled "1 ft 0 in",
+RenderStyle layout constants (radius/offsets), SVG serializer rewritten on RenderTransform.
+Deferred within-session (listed in the plan's STATUS banner): renderPng->RenderTransform; centroid/snapped/
+PNG-pixel/sharing test upgrades; bundled font + golden test + spec-bullet amendment.
+Ponytail stance held on #10: per-renderer sub-pixel TEXT-measurement adapters -> v2 (geometry+style parity is
+structural); this needs the spec's render bullet amended, tracked as a remaining item.
+Not built. Plans 1-3 remain the shipped, verified value.
