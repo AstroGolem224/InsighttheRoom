@@ -167,7 +167,9 @@ import itr.core.geometry.Vec3
 private val PLAUSIBLE = 1.8..4.0   // metres; reject implausible room heights
 
 sealed interface CeilingMeasurement {
-    data class Measured(val heightM: Double) : CeilingMeasurement
+    data class Measured(val heightM: Double) : CeilingMeasurement {
+        init { require(heightM.isFinite() && heightM in PLAUSIBLE) { "implausible ceiling height: $heightM" } }
+    }
     data object Skipped : CeilingMeasurement
     fun heightOrNull(): Double? = (this as? Measured)?.heightM
 }
@@ -202,49 +204,63 @@ package itr.core.scan
 import itr.core.geometry.Vec2
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class MarkerTrackerTest {
     private fun box(x: Double, y: Double, s: Double = 0.2) = BoundingBox(x, y, x + s, y + s)
+    private fun obs(cls: String, x: Double, px: Double, conf: Double) = Observation(cls, box(x, 0.1), Vec2(px, 1.0), conf)
+    private fun firstId(t: MarkerTracker) = t.candidates().first().id
 
-    @Test fun `overlapping same-class boxes across frames associate to ONE track (IoU), not the vertex distance`() {
+    @Test fun `overlapping same-class boxes across frames associate to ONE track (IoU)`() {
         val t = MarkerTracker()
-        t.observe(Observation("chair", box(0.10, 0.10), Vec2(1.0,1.0), 0.6))
-        t.observe(Observation("chair", box(0.12, 0.10), Vec2(1.05,1.0), 0.8))   // high IoU -> same track
+        t.observeFrame(listOf(obs("chair", 0.10, 1.0, 0.6)))
+        t.observeFrame(listOf(obs("chair", 0.12, 1.05, 0.8)))   // high IoU -> same track
         assertEquals(1, t.candidates().size)
     }
 
-    @Test fun `two ADJACENT same-class chairs (non-overlapping boxes) stay TWO tracks`() {
+    @Test fun `two ADJACENT same-class chairs in ONE frame stay TWO tracks (one-to-one, no double-claim)`() {
         val t = MarkerTracker()
-        t.observe(Observation("chair", box(0.10, 0.10), Vec2(1.0,1.0), 0.7))
-        t.observe(Observation("chair", box(0.60, 0.10), Vec2(1.4,1.0), 0.7))   // no box overlap -> separate
+        t.observeFrame(listOf(obs("chair", 0.10, 1.0, 0.7), obs("chair", 0.60, 1.4, 0.7)))   // non-overlapping boxes
         assertEquals(2, t.candidates().size)
     }
 
-    @Test fun `markers() exposes only CONFIRMED tracks; candidates are hidden until confirmed`() {
+    @Test fun `markers() exposes only CONFIRMED; objectsResolved reflects remaining candidates`() {
         val t = MarkerTracker()
-        val id = t.observe(Observation("sofa", box(0.1,0.1), Vec2(1.0,1.0), 0.9))
-        assertEquals(0, t.markers().size)          // not yet confirmed
-        t.confirm(id); assertEquals(1, t.markers().size)
+        t.observeFrame(listOf(obs("sofa", 0.1, 1.0, 0.9)))
+        assertEquals(0, t.markers().size); assertFalse(t.objectsResolved())
+        t.confirm(firstId(t)); assertEquals(1, t.markers().size); assertTrue(t.objectsResolved())
     }
 
-    @Test fun `display label is editable and separate from detected class (no re-duplication)`() {
+    @Test fun `display label is separate from detected class; a later same-class detection does not re-duplicate`() {
         val t = MarkerTracker()
-        val id = t.observe(Observation("sofa", box(0.1,0.1), Vec2(1.0,1.0), 0.6)); t.confirm(id)
-        t.relabel(id, "Couch")
-        // a later detection of the ORIGINAL class merges into the SAME track (detectedClass unchanged)
-        t.observe(Observation("sofa", box(0.11,0.1), Vec2(1.02,1.0), 0.7))
-        assertEquals(1, t.markers().size)
-        assertEquals("Couch", t.markers().first().label)   // persisted label is the display label
+        t.observeFrame(listOf(obs("sofa", 0.1, 1.0, 0.6))); val id = firstId(t); t.confirm(id); t.relabel(id, "Couch")
+        t.observeFrame(listOf(obs("sofa", 0.11, 1.02, 0.7)))
+        assertEquals(1, t.markers().size); assertEquals("Couch", t.markers().first().label)
     }
 
-    @Test fun `move, reject, split, merge`() {
+    @Test fun `a manually moved marker is not dragged back by later auto detections`() {
         val t = MarkerTracker()
-        val a = t.observe(Observation("tv", box(0.1,0.1), Vec2(0.0,0.0), 0.8)); t.confirm(a)
-        t.move(a, Vec2(0.5,0.5)); assertEquals(Vec2(0.5,0.5), t.markers().first().position)
-        val b = t.observe(Observation("tv", box(0.6,0.1), Vec2(2.0,0.0), 0.8)); t.confirm(b)
-        t.merge(a, b); assertEquals(1, t.markers().size)   // merged into one
-        t.reject(a); assertEquals(0, t.markers().size)
+        t.observeFrame(listOf(obs("tv", 0.1, 0.0, 0.8))); val id = firstId(t); t.confirm(id)
+        t.move(id, Vec2(0.5,0.5))
+        t.observeFrame(listOf(obs("tv", 0.11, 0.0, 0.9)))   // associates but must NOT move the locked position
+        assertEquals(Vec2(0.5,0.5), t.markers().first().position)
+        assertTrue(t.candidates().first().manualPosition)
+    }
+
+    @Test fun `split creates a second distinct track; merge combines history; reject removes`() {
+        val t = MarkerTracker()
+        t.observeFrame(listOf(obs("tv", 0.1, 0.0, 0.8))); val a = firstId(t); t.confirm(a)
+        val b = t.split(a, Vec2(2.0,0.0)); assertEquals(2, t.candidates().size)
+        t.confirm(b); t.merge(a, b); assertEquals(1, t.candidates().size)   // merged back
+        t.reject(a); assertEquals(0, t.candidates().size)
+    }
+
+    @Test fun `invalid observations are rejected at construction`() {
+        assertFailsWith<IllegalArgumentException> { BoundingBox(0.5,0.5,0.4,0.6) }        // right<left
+        assertFailsWith<IllegalArgumentException> { Observation("", box(0.1,0.1), Vec2(1.0,1.0), 0.5) }   // blank class
+        assertFailsWith<IllegalArgumentException> { Observation("tv", box(0.1,0.1), Vec2(1.0,1.0), 1.5) } // conf>1
     }
 }
 ```
@@ -261,7 +277,12 @@ import itr.core.model.RoomObject
 import kotlin.math.max
 import kotlin.math.min
 
+/** Normalized [0,1] detector box. Validated: finite, ordered, non-empty. */
 data class BoundingBox(val left: Double, val top: Double, val right: Double, val bottom: Double) {
+    init {
+        require(listOf(left, top, right, bottom).all { it.isFinite() && it in 0.0..1.0 }) { "box out of [0,1]" }
+        require(right > left && bottom > top) { "degenerate box" }
+    }
     fun iou(o: BoundingBox): Double {
         val ix = max(0.0, min(right, o.right) - max(left, o.left))
         val iy = max(0.0, min(bottom, o.bottom) - max(top, o.top))
@@ -270,52 +291,73 @@ data class BoundingBox(val left: Double, val top: Double, val right: Double, val
         return if (union <= 0) 0.0 else inter / union
     }
 }
-data class Observation(val detectedClass: String, val box: BoundingBox, val position: Vec2, val confidence: Double)
+data class Observation(val detectedClass: String, val box: BoundingBox, val position: Vec2, val confidence: Double) {
+    init {
+        require(detectedClass.isNotBlank()) { "blank class" }
+        require(position.x.isFinite() && position.z.isFinite()) { "non-finite position" }
+        require(confidence.isFinite() && confidence in 0.0..1.0) { "confidence out of [0,1]" }
+    }
+}
 enum class MarkerState { CANDIDATE, CONFIRMED }
-data class TrackedMarker(val id: Long, val detectedClass: String, val displayLabel: String, val position: Vec2, val confidence: Double, val state: MarkerState, val observations: Int)
+data class TrackedMarker(val id: Long, val detectedClass: String, val displayLabel: String, val position: Vec2, val confidence: Double, val state: MarkerState, val observations: Int, val manualPosition: Boolean)
 
 /**
- * One-to-one marker tracker. A new observation associates to an existing SAME-class track when their
- * image boxes overlap (IoU ≥ [iouThreshold]) AND the 3D gate holds ([maxAssocM]); else it's a new
- * CANDIDATE. Position is a confidence-weighted running estimate (outlier-gated by the 3D gate).
- * markers() returns only CONFIRMED tracks as RoomObjects (displayLabel + position + confidence).
+ * One-to-one multi-object tracker. Each frame is a BATCH: observeFrame greedily assigns each
+ * detection to at most one existing SAME-class track (highest IoU ≥ [iouThreshold], gated by
+ * [maxAssocM]); each track takes at most one detection per frame; unmatched detections become new
+ * CANDIDATE tracks. The tracked position is a confidence-weighted estimate UNLESS the user moved the
+ * marker (manualPosition), in which case auto-updates stop until the position is edited again.
+ * markers() returns only CONFIRMED tracks. objectsResolved() = no CANDIDATE remains.
  */
 class MarkerTracker(private val iouThreshold: Double = 0.3, private val maxAssocM: Double = 0.5) {
+    init { require(iouThreshold.isFinite() && iouThreshold in 0.0..1.0 && maxAssocM.isFinite() && maxAssocM > 0) { "bad thresholds" } }
     private class Track(val id: Long, val detectedClass: String, var displayLabel: String,
                         var lastBox: BoundingBox, var position: Vec2, var confidence: Double,
-                        var state: MarkerState, var observations: Int, var wSum: Double)
+                        var state: MarkerState, var observations: Int, var wSum: Double, var manual: Boolean)
     private val tracks = mutableListOf<Track>()
     private var counter = 0L
 
-    fun observe(o: Observation): Long {
-        // best same-class match by IoU, gated by 3D distance; deterministic (max IoU, then lowest id)
-        val match = tracks.filter { it.detectedClass == o.detectedClass &&
-                (it.position - o.position).length() <= maxAssocM && it.lastBox.iou(o.box) >= iouThreshold }
-            .maxWithOrNull(compareBy({ it.lastBox.iou(o.box) }, { -it.id }))
-        if (match != null) {
-            val w = o.confidence
-            match.position = Vec2((match.position.x * match.wSum + o.position.x * w) / (match.wSum + w),
-                                  (match.position.z * match.wSum + o.position.z * w) / (match.wSum + w))
-            match.wSum += w; match.observations += 1; match.lastBox = o.box
-            match.confidence = max(match.confidence, o.confidence)
-            return match.id
+    /** Process one frame's detections as a batch; each track takes at most one detection. */
+    fun observeFrame(observations: List<Observation>) {
+        val taken = HashSet<Long>()
+        // deterministic order: highest-confidence detections claim their best track first
+        for (o in observations.sortedWith(compareByDescending<Observation> { it.confidence }.thenBy { it.box.left })) {
+            val match = tracks.filter { it.id !in taken && it.detectedClass == o.detectedClass &&
+                    (it.position - o.position).length() <= maxAssocM && it.lastBox.iou(o.box) >= iouThreshold }
+                .maxWithOrNull(compareBy({ it.lastBox.iou(o.box) }, { -it.id }))
+            if (match != null) {
+                taken += match.id; match.lastBox = o.box; match.observations += 1
+                match.confidence = max(match.confidence, o.confidence)
+                if (!match.manual) {   // auto position only until the user overrides it
+                    val w = o.confidence
+                    match.position = Vec2((match.position.x * match.wSum + o.position.x * w) / (match.wSum + w),
+                                          (match.position.z * match.wSum + o.position.z * w) / (match.wSum + w))
+                    match.wSum += w
+                }
+            } else tracks += Track(counter++, o.detectedClass, o.detectedClass, o.box, o.position, o.confidence, MarkerState.CANDIDATE, 1, o.confidence, false)
         }
-        val t = Track(counter++, o.detectedClass, o.detectedClass, o.box, o.position, o.confidence, MarkerState.CANDIDATE, 1, o.confidence)
-        tracks += t; return t.id
     }
 
     fun confirm(id: Long) { track(id)?.state = MarkerState.CONFIRMED }
     fun reject(id: Long) { tracks.removeAll { it.id == id } }
     fun relabel(id: Long, label: String) { track(id)?.displayLabel = label }
-    fun move(id: Long, position: Vec2) { track(id)?.position = position }
-    fun split(id: Long): Long { val t = track(id) ?: return -1; val n = Track(counter++, t.detectedClass, t.displayLabel, t.lastBox, t.position, t.confidence, t.state, 1, t.confidence); tracks += n; return n.id }
-    fun merge(keep: Long, drop: Long) { if (track(keep) != null) tracks.removeAll { it.id == drop } }
+    fun move(id: Long, position: Vec2) { track(id)?.let { it.position = position; it.manual = true } }   // lock from auto-drift
+    /** Split off a new track at [at] with the same class/label (e.g. two merged objects). */
+    fun split(id: Long, at: Vec2): Long { val t = track(id) ?: return -1
+        val n = Track(counter++, t.detectedClass, t.displayLabel, t.lastBox, at, t.confidence, t.state, 1, t.wSum, true); tracks += n; return n.id }
+    /** Merge [drop] into [keep], combining observation history + confidence; classes must match. */
+    fun merge(keep: Long, drop: Long) {
+        val k = track(keep) ?: return; val d = track(drop) ?: return
+        require(k.detectedClass == d.detectedClass) { "cannot merge different classes" }
+        k.observations += d.observations; k.confidence = max(k.confidence, d.confidence); tracks.remove(d)
+    }
 
     fun candidates(): List<TrackedMarker> = tracks.map { it.view() }
+    fun objectsResolved(): Boolean = tracks.none { it.state == MarkerState.CANDIDATE }   // the FSM prerequisite
     fun markers(): List<RoomObject> = tracks.filter { it.state == MarkerState.CONFIRMED }.map { RoomObject(it.displayLabel, it.position, it.confidence) }
 
     private fun track(id: Long) = tracks.firstOrNull { it.id == id }
-    private fun Track.view() = TrackedMarker(id, detectedClass, displayLabel, position, confidence, state, observations)
+    private fun Track.view() = TrackedMarker(id, detectedClass, displayLabel, position, confidence, state, observations, manual)
 }
 ```
 
@@ -341,6 +383,7 @@ package itr.core.scan
 
 import itr.core.ar.*
 import itr.core.geometry.Plane
+import itr.core.geometry.RoomBasis
 import itr.core.geometry.Vec2
 import itr.core.geometry.Vec3
 import kotlin.test.Test
@@ -351,27 +394,30 @@ import kotlin.test.assertNotNull
 class DetectionPlacementTest {
     private val floor = Plane(Vec3(0.0,0.0,0.0), Vec3(0.0,1.0,0.0))
     private val basis = RoomBasis(Vec3(0.0,0.0,0.0), Vec3(0.0,1.0,0.0), Vec3(1.0,0.0,0.0))
-    private val roomLocal = listOf(Vec2(0.0,0.0), Vec2(3.0,0.0), Vec2(3.0,4.0), Vec2(0.0,4.0))
     private fun record() = FrameRecord(1, 0, 0,
         Pose(Vec3(1.5, 2.0, 2.0), Quaternion.aroundX(Math.toRadians(-90.0))),   // camera above, looking down
         CameraIntrinsics(500.0,500.0,320.0,240.0,640,480),
         ImageTransform(640,480,0,0,640,480,640,480,0,false))
+    // box centered on the principal point (bottom-center (0.5,0.5)) -> ray straight down -> world (1.5,0,2.0)
+    private val centerBox = BoundingBox(0.4,0.3,0.6,0.5)
 
     @Test fun `a detection over the floor becomes a room-local observation`() {
-        // detector centre (0.5,0.5) -> straight down -> world ~ (1.5,0,2.0) -> room-local inside the 3x4 room
-        val obs = placeDetection(record(), "chair", BoundingBox(0.4,0.4,0.6,0.6), DetectorPoint(0.5,0.5), 0.8, floor, basis, roomLocal)
+        // world (1.5,0,2.0) -> local (1.5,2.0), inside the 3x4 room
+        val room3x4 = listOf(Vec2(0.0,0.0), Vec2(3.0,0.0), Vec2(3.0,4.0), Vec2(0.0,4.0))
+        val obs = placeDetection(record(), "chair", centerBox, 0.8, floor, basis, room3x4)
         assertNotNull(obs); assertEquals("chair", obs!!.detectedClass)
     }
 
     @Test fun `a detection landing outside the room polygon is rejected`() {
-        // point far to the side -> outside the 3x4 room -> null
-        val obs = placeDetection(record(), "chair", BoundingBox(0.0,0.0,0.1,0.1), DetectorPoint(0.99,0.99), 0.8, floor, basis, roomLocal)
-        assertNull(obs)
+        // same projection to local (1.5,2.0), but the room is a small unit square [0,1]x[0,1] -> outside
+        val unitRoom = listOf(Vec2(0.0,0.0), Vec2(1.0,0.0), Vec2(1.0,1.0), Vec2(0.0,1.0))
+        assertNull(placeDetection(record(), "chair", centerBox, 0.8, floor, basis, unitRoom))
     }
 
     @Test fun `a ray that misses the floor (parallel) is rejected`() {
+        val room3x4 = listOf(Vec2(0.0,0.0), Vec2(3.0,0.0), Vec2(3.0,4.0), Vec2(0.0,4.0))
         val horiz = record().copy(pose = Pose(Vec3(1.5,2.0,2.0), Quaternion.IDENTITY))   // looking -z, never hits floor
-        assertNull(placeDetection(horiz, "chair", BoundingBox(0.4,0.4,0.6,0.6), DetectorPoint(0.5,0.5), 0.8, floor, basis, roomLocal))
+        assertNull(placeDetection(horiz, "chair", centerBox, 0.8, floor, basis, room3x4))
     }
 }
 ```
@@ -391,14 +437,17 @@ import itr.core.geometry.Plane
 import itr.core.geometry.pointInPolygon
 
 /**
- * Project a detection's bottom-center against its SOURCE frame onto [floor], convert to room-local via
- * [basis], and return an Observation only if the point is finite AND inside [roomLocalPolygon]. Pure —
- * this is the placement correctness the controller relies on.
+ * Project a detection's bottom-center — DERIVED from its box, so the projected point always matches the
+ * box — against its SOURCE frame onto [floor], convert to room-local via [basis], and return an
+ * Observation only if the point is finite AND inside [roomLocalPolygon]. Pure — the placement
+ * correctness the controller relies on. (The detector supplies label/box/confidence; the bottom-center
+ * is box center-x, box bottom.)
  */
 fun placeDetection(
-    record: FrameRecord, detectedClass: String, box: BoundingBox, bottomCenter: DetectorPoint,
+    record: FrameRecord, detectedClass: String, box: BoundingBox,
     confidence: Double, floor: Plane, basis: RoomBasis, roomLocalPolygon: List<itr.core.geometry.Vec2>,
 ): Observation? {
+    val bottomCenter = DetectorPoint((box.left + box.right) / 2, box.bottom)
     val world = projectDetectorPointToFloor(record, bottomCenter, floor) ?: return null
     val local = basis.toLocal(world)
     if (!local.x.isFinite() || !local.z.isFinite()) return null
@@ -500,14 +549,15 @@ fun assembleRoom(
 
 - [ ] **Step 2: Model asset gate** — copy the Phase-0 `.tflite`; a build/test step asserts its SHA-256 == PHASE0.md before use.
 
-- [ ] **Step 3: `Detector.kt`** — a factory + mapping layer (NOT a bare TODO). `DetectorFactory.create(context)` builds a MediaPipe `ObjectDetector` with the GPU delegate (CPU fallback if GPU init fails), score threshold (e.g. 0.4), max results, and the COCO allow-list (chair/couch/bed/dining table/tv/potted plant/refrigerator/…). `detect(image: CameraImage): List<Detection>` builds an `MPImage` from the RGBA bytes (`ByteBufferImageBuilder`, RGBA_8888, width×height), runs the detector, and maps each allowed result to `Detection(label, DetectorPoint(box.centerX/imgW, box.bottom/imgH), score)` — the bottom-center in the SAME unrotated normalized space as `FrameRecord.imageTransform` (see the coordinate-space contract at the top). Closes the `MPImage`. The RGBA→MPImage + result mapping is device/runtime glue verified by the checklist; the DetectorPoint→world→room path is the JVM-tested pure core (Task 4).
+- [ ] **Step 3: `Detector.kt`** — a factory + mapping layer (NOT a bare TODO). Type: `data class Detection(val label: String, val normalizedBox: BoundingBox, val confidence: Double)` (box normalized to [0,1] in the unrotated image space; `placeDetection` derives the bottom-center from it). `DetectorFactory.create(context)` builds a MediaPipe `ObjectDetector` with the GPU delegate (CPU fallback if GPU init fails), score threshold (e.g. 0.4), max results, and the COCO allow-list (chair/couch/bed/dining table/tv/potted plant/refrigerator/…). `detect(image: CameraImage): List<Detection>` builds an `MPImage` from the RGBA bytes (`ByteBufferImageBuilder`, RGBA_8888, width×height), runs the detector, filters to the allow-list + threshold, and maps each result's pixel box to a normalized `BoundingBox(left/w, top/h, right/w, bottom/h)`. Closes the `MPImage`. The RGBA→MPImage + result mapping is device/runtime glue verified by the checklist; the box→bottom-center→world→room path is the JVM-tested pure core (Task 4).
 
 - [ ] **Step 4: `ScanController`** (the wiring; all state single-threaded on the AR frame thread):
-  - Holds `ScanStage`, `FloorSelection` (+ its `RoomBasis`, locked after two eligible projected corners), the world corner taps, `MarkerTracker`, `FramePipeline`, `CeilingMeasurement`.
-  - **Corner tap:** `frame.hitTest(displayPoint)` → require `floorSelection.isHitEligible(hitPlane)` → project the hit onto `floor.referencePlane` → store the projected world point. Lock the `RoomBasis` (origin = first corner, normal = frozen reference normal, X = first→second projected edge) once two eligible corners exist.
-  - **Detection (async → marshalled onto the AR frame thread):** each AR frame, `acquireSnapshot()` → `pipeline.submit(snapshot.record)` → hand the RGBA to `Detector.detect` on a worker; when it returns, **post the result list back to the AR frame thread**, then `pipeline.completeApplying(snapshot.record.id) { rec -> results.mapNotNull { placeDetection(rec, it.label, it.box, it.bottomCenter, it.confidence, floor.referencePlane, basis, plan.rawCorners) } }` — ONE completeApplying per record for the WHOLE list (never per-detection) → `observations.forEach { tracker.observe(it) }`. Handle every pipeline terminal: empty result → `pipeline.fail(id)`; detector error → `pipeline.fail(id)`; stale/backpressure drop → nothing to complete; on a basis edit → `pipeline.drain()` + `onBasisRevised(rev+1)` after clearing markers.
-  - **Confirm/edit:** wizard OBJECTS stage drives `tracker.confirm/reject/relabel/move/split/merge`; OBJECTS→REVIEW only when all candidates are resolved (`markersConfirmed`).
-  - **Finish:** `assembleRoom(..., markers = tracker.markers(), finalized = true)` → wrap in a one-room `Building(id, name, listOf(room), now)` → `ScanRepository.saveBuilding(building)`.
+  - Holds `ScanStage`, `FloorSelection` (+ its `RoomBasis`, locked after two eligible projected corners), the world corner taps, `MarkerTracker`, `FramePipeline`, `CeilingMeasurement`, a monotonically-increasing `basisRevision`.
+  - **Corner tap:** `frame.hitTest(displayPoint)` → require `floorSelection.isHitEligible(hitPlane)` → **reject if the hit's signed distance to `floor.referencePlane` exceeds a named tolerance** (drift beyond the frozen plane) → project the hit onto `floor.referencePlane` → store the projected world point. Lock the `RoomBasis` once two eligible corners exist AND the projected first edge length ≥ the geometry min-edge (else keep tapping) — origin = first corner, normal = frozen reference normal, X = first→second projected edge.
+  - **Detection (async → marshalled onto the AR frame thread):** each AR frame, `acquireSnapshot()` → `if (pipeline.submit(snapshot.record))` **only then** hand the RGBA to `Detector.detect` on a worker; if `submit` returns false (backpressure/dup), discard the snapshot and create NO callback. When detect returns, **post the result list back to the AR frame thread**, then call `pipeline.completeApplying(snapshot.record.id) { rec -> results.mapNotNull { placeDetection(rec, it.label, it.normalizedBox, it.confidence, floor.referencePlane, basis, plan.rawCorners) } }` — exactly ONE completeApplying per record for the WHOLE list (never per-detection) → `tracker.observeFrame(observations)`. An EMPTY result completes normally through that same single call (an empty list is a successful inference, not a failure). `pipeline.fail(id)` / `pipeline.cancel(id)` are reserved for a THROWN or cancelled inference **before** completion. On a basis-defining edit: bump `basisRevision`, call `pipeline.onBasisRevised(basisRevision)` (stales all in-flight records — Plan 3's reusable API; NOT `shutdown()`), set `session.basisRevision = basisRevision` on the AR thread.
+  - **Basis edit → markers (v1 destructive reset):** editing a basis-defining corner **clears the markers and returns to OBJECTS unconfirmed, with a user confirmation** (see the PLAN amendment). Atomic old→new-basis marker rebasing is a v2 item.
+  - **Confirm/edit:** the OBJECTS stage drives `tracker.confirm/reject/relabel/move/split/merge`; the FSM prerequisite `markersConfirmed` is `tracker.objectsResolved()` (no CANDIDATE remains) — never a free boolean.
+  - **Finish:** `assembleRoom(..., markers = tracker.markers(), ceiling = ceilingMeasurement, finalized = true)` → wrap in a one-room `Building(id, name, listOf(room), now)` → `ScanRepository.saveBuilding(building)`.
 
 - [ ] **Step 5: `ScanWizardScreen`** — Compose per stage over `ARSceneView`; forwards `onSessionUpdated`→`session.onFrame` and layout/rotation→`session.onDisplayGeometry`. Review builds ONE `buildDisplayList(room.floorPlan, units)` and passes it to `FloorplanCanvas` / `toSvg` / `renderPngBytes` → `shareExport`.
 
