@@ -376,3 +376,12 @@ R6: APPROVED.
 Pure JVM-TDD'd: wizard FSM, validated ceiling, best-edge multi-object tracker (auto/display position,
 candidate/confirmed, stable-id editing), pure placeDetection (project->room-local->containment), assembly.
 Glue (MediaPipe detector, controller threading, Compose wizard) = compile + DATED device checklist.
+
+## Act 3 — Build Plan 4 — PASS
+Codex built Tasks 1-6. Model SHA-256 40338edf…dbf58 verified + a verifyEfficientDetModel Gradle preBuild
+gate. API adjustments: MPImage.IMAGE_FORMAT_RGBA (resolved), added androidx.activity:activity:1.9.2
+(SceneView ARSceneView(Context) needs ComponentActivity, not on the consumer classpath). Deviation: 3
+test names had `;` -> renamed. `./gradlew :core:test :feature-scan:compileDebugKotlin` BUILD SUCCESSFUL.
+Claude verified: fresh proof green; 25 new scan tests (Wizard 4, Ceiling 4, MarkerTracker 9, Placement 3,
+Assembly 5); MarkerTracker has observeFrame/auto+display position/objectsResolved; DetectionPlacement uses
+projectDetectorPointToFloor + pointInPolygon. Runtime = PLAN4-DEVICE-CHECKLIST.md.
