@@ -7,3 +7,6 @@ dependencyResolutionManagement {
 rootProject.name = "InsightTheRoom"
 include(":core")
 include(":persistence")
+include(":export-core")
+include(":floorplan")
+include(":export-android")
