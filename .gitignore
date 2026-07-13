@@ -1,0 +1,22 @@
+# Android / Gradle
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+*.keystore
+!debug.keystore
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.kotlin/
+
+# ARCore recorded-session test fixtures — never commit (camera video + device fingerprint)
+/fixtures/
+*.mp4
+*.arcore
+
+# OS
+.DS_Store
