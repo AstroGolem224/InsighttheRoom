@@ -312,3 +312,15 @@ PNG-pixel/sharing test upgrades; bundled font + golden test + spec-bullet amendm
 Ponytail stance held on #10: per-renderer sub-pixel TEXT-measurement adapters -> v2 (geometry+style parity is
 structural); this needs the spec's render bullet amended, tracked as a remaining item.
 Not built. Plans 1-3 remain the shipped, verified value.
+
+## Rounds 3-5 — Codex (Plan 5) → APPROVED (round 5)
+R3 (10): missing pointInPolygon import; centroid fallback on corner + untested; sanitize-once not enforced;
+literal control chars in source; locale test didn't check numeric syntax; SVG 0.1px vs PNG/Compose float
+divergence; RenderTransform no max-dim guard; font not bundled; sharing not test-first.
+R4 (5): interiorLabelPoint not STRICTLY interior (triangle centroid on boundary); no renderer golden/invariant
+test; sharing still impl-first; RenderTransform.pad unvalidated; PNG "bundled font" wording.
+R5: APPROVED.
+Key: shared RenderTransform (quantized 0.1px, validated) used by SVG+PNG+Compose; sanitizeLabel once +
+validateForRender enforces it; strictlyInside interior-label fallback; SVG-vs-transform parity invariant test;
+Locale.US throughout; MIME-from-extension sharing. Bundled-font pixel-text parity formally deferred to v2
+(PLAN.md render bullet amended).
