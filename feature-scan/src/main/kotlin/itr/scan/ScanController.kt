@@ -36,7 +36,6 @@ import itr.persistence.ScanRepository
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 class ScanController(
@@ -265,11 +264,14 @@ class ScanController(
         basisRevision += 1
         pipeline.onBasisRevised(basisRevision)
         session.basisRevision = basisRevision
+        session.pause()
         changed()
     }
 
     fun onForeground() {
-        if (!destroyed && stage == ScanStage.OBJECTS && !finalizingObjects) submissionsOpen = true
+        if (destroyed) return
+        session.resume()
+        if (stage == ScanStage.OBJECTS && !finalizingObjects) submissionsOpen = true
         changed()
     }
 
@@ -278,12 +280,9 @@ class ScanController(
         destroyed = true
         submissionsOpen = false
         pipeline.shutdown()
+        detectorExecutor.execute { detector.close() }
         detectorExecutor.shutdown()
-        if (!detectorExecutor.awaitTermination(DETECTOR_SHUTDOWN_SECONDS, TimeUnit.SECONDS)) {
-            detectorExecutor.shutdownNow()
-            detectorExecutor.awaitTermination(DETECTOR_SHUTDOWN_SECONDS, TimeUnit.SECONDS)
-        }
-        detector.close()
+        session.close()
     }
 
     fun previewRoom(
@@ -383,6 +382,5 @@ class ScanController(
         private const val MAX_IN_FLIGHT = 2
         private const val MIN_EDGE_M = 0.05
         private const val FROZEN_PLANE_DRIFT_TOLERANCE_M = 0.03
-        private const val DETECTOR_SHUTDOWN_SECONDS = 2L
     }
 }

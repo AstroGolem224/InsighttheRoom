@@ -385,3 +385,14 @@ test names had `;` -> renamed. `./gradlew :core:test :feature-scan:compileDebugK
 Claude verified: fresh proof green; 25 new scan tests (Wizard 4, Ceiling 4, MarkerTracker 9, Placement 3,
 Assembly 5); MarkerTracker has observeFrame/auto+display position/objectsResolved; DetectionPlacement uses
 projectDetectorPointToFloor + pointInPolygon. Runtime = PLAN4-DEVICE-CHECKLIST.md.
+
+---
+
+## Plan 6 (app shell) — Act 3 Build
+
+**Codex build** (`gpt-5.6-sol`, thread 019f5d24) after 5-round review APPROVED. Implemented `:app` module: AppSettings + units codec, HomeRow mapping (both pure, core), SettingsRepository (DataStore, IOException→defaults), Home/Detail/Settings VMs, AppModule Hilt graph, ScanControllerFactory (assisted: DetectorFactory.create + ArCoreSession + ScanController per scan, nothing AR a singleton), Compose Nav + 4 screens, no-INTERNET manifest, NoNetworkTest. Modified ScanWizardScreen (createController lambda) + ScanController.destroy (queued detector.close + ordered shutdown, session pause/resume/close).
+
+**Deviations (all faithful):** superpowers exec-skill NA→direct; `;` illegal in backtick test name→"and"; AndroidX Core's `DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` also stripped with `tools:node="remove"` to keep the "exactly CAMERA" invariant; SceneView 2.2.1 has no public `ARSceneView.pause()/resume()`→lifecycle callbacks pause/resume the concrete ARCore `Session`, `onClose` destroys the `ARSceneView`; `ScanController.destroy()` adjusted per Task 5 (queued `detector.close()` as executor's final task + plain `shutdown()`, no UI-blocking `awaitTermination`).
+
+**Claude's verdict:** Manifest = exactly CAMERA (INTERNET/ACCESS_NETWORK_STATE/DYNAMIC_RECEIVER stripped), backup off. Factory uses real ctors. destroy() correct. Wiring correct. Secret-scan clean.
+**Proof (self-run, --rerun-tasks):** `:app:testDebugUnitTest` 5/5, `:app:testReleaseUnitTest` 5/5, `:core:test` settings 6/6, `:app:compileDebugKotlin` + `:feature-scan:compileDebugKotlin` — all BUILD SUCCESSFUL, 0 failures.
