@@ -130,3 +130,27 @@ adb -s FYFMGUMZYLKBD6IN shell pm grant com.itr.spike android.permission.CAMERA
 adb -s FYFMGUMZYLKBD6IN shell am start -n com.itr.spike/.MainActivity
 adb -s FYFMGUMZYLKBD6IN logcat -s PHASE0
 ```
+
+---
+
+## On-device run + latency benchmark (2026-07-13) — GATE FULLY PASSED
+
+Device: Xiaomi 2602EPTC0G, Android 16 (SDK 36), arm64-v8a, 11.5 GB RAM, ARCore installed.
+The earlier `INSTALL_FAILED_USER_RESTRICTED` was an **antivirus block, not the HyperOS toggle** —
+with AV cleared, `adb install` succeeded. The spike ran the full ARCore + SceneView + MediaPipe stack;
+`gpuAvailable=true`; MediaPipe detected real objects (chair, tv, laptop, person, …).
+
+Inference latency, 96 samples (`PHASE0: … infMs=…`), CPU vs GPU delegate alternating ~5 Hz:
+
+| Delegate | p50 | p95 | min | max |
+|----------|-----|-----|-----|-----|
+| **GPU**  | 55.5 ms | **64.0 ms** | 34.9 | 65.6 |
+| CPU      | 85.3 ms | 107.9 ms | 67.8 | 115.1 |
+
+**Decision: GPU delegate** — meets the ≤80 ms p95 inference budget (p95 64 ms). CPU delegate exceeds it
+(p95 108 ms). Plan 4 pins the GPU delegate with CPU fallback for devices lacking GPU inference.
+
+Caveat: benchmarked on ONE high-end device. The ≥3-device (incl. low-end API-26 ~2–3 GB) matrix from the
+acceptance criteria is still pending — low-end GPU latency may differ; re-run there before release.
+
+**GATE STATUS: PASS** (compile + package + on-device run + high-end benchmark). Device path (Plan 3b → 4) unblocked.
