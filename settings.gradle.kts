@@ -6,6 +6,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "InsightTheRoom"
 include(":core")
+include(":core-arcore")
 include(":persistence")
 include(":export-core")
 include(":floorplan")
