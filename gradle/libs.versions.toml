@@ -10,6 +10,7 @@ androidx-test-core = "1.6.1"
 coroutines = "1.9.0"
 composeBom = "2024.09.03"
 sceneview = "2.2.1"
+mediapipe = "0.10.14"
 
 [libraries]
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
@@ -26,7 +27,9 @@ compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeB
 compose-ui = { module = "androidx.compose.ui:ui" }
 compose-foundation = { module = "androidx.compose.foundation:foundation" }
 androidx-core-ktx = { module = "androidx.core:core-ktx", version = "1.13.1" }
+androidx-activity = { module = "androidx.activity:activity", version = "1.9.2" }
 sceneview-arsceneview = { module = "io.github.sceneview:arsceneview", version.ref = "sceneview" }
+mediapipe-tasks-vision = { module = "com.google.mediapipe:tasks-vision", version.ref = "mediapipe" }
 
 [plugins]
 android-library = { id = "com.android.library", version.ref = "agp" }
