@@ -136,3 +136,19 @@ All 7 Round-4 findings addressed. 5 remaining (all micro-refinements of round-4 
 
 ## Resolution — MAX_ROUNDS (5) hit, last verdict REVISE
 Not a genuine deadlock. Finding trajectory: 22 → 15 → 12 → 7 → 5, strictly decreasing, and from Round 2 onward every finding was a refinement or a self-contradiction introduced by the prior round's accepted edit — no fundamental architecture flaw survived Round 1. All 61 findings across 5 rounds were incorporated (none rejected outright; two taken in Ponytail-lite form). Codex is in an asymptotic refinement mode; further rounds would keep surfacing ever-finer measurement/spec nitpicks that belong to Phase 0 and the test plan, not the architecture plan. Handing to Matthias for final sign-off.
+
+---
+
+# Plan 1 (core geometry) — Codex review, 6 rounds → APPROVED
+
+Separate adversarial pass on the IMPLEMENTATION plan (concrete Kotlin), not just architecture.
+Finding trajectory: 22 → 10 → 7 → 3 → 1 → 0 (APPROVED).
+
+Round 1 (22): **RoomBasis handedness bug — `up.cross(xAxis)` = Y×X = −Z mirrors every local z** (critical, would ship wrong floorplans); test couldn't catch it (all points on X axis); no NaN guards; greedy Manhattan snap doesn't close; self-intersection missed touch/T-junction; FloorPlan walls/area copyable (stale risk); ceiling abs() masks reversed taps; winding validation absent; wallsFromCorners allowed 2 corners.
+Round 2 (10): `const` is a reserved Kotlin keyword (won't compile); toCcw broke raw↔snapped index correspondence + contradicted contract; snap needed angular+displacement safety limits + delta; FloorPlan constructor bypassable; zAxis not normalized; ceiling "tilted" test not actually tilted.
+Round 3 (7): winding field missing from PolygonValidation; displacement branch untested; 25cm default too loose (add relative); SnapResult discarded by builder; manhattanSnap accepted invalid input when called directly; non-finite snap params disable guards; misleading test comment.
+Round 4 (3): manhattanSnap must validate its GENERATED polygon; two isolating displacement tests (absolute-only, relative-only); isValid must exclude DEGENERATE winding.
+Round 5 (1): degenerate validity lost in buildFloorPlan (empty issues → FloorPlan.isValid wrongly true).
+Round 6: **APPROVED** — DEGENERATE_AREA issue propagates; regression test added.
+
+All findings incorporated (none rejected). Result: correctness core is emulator-free TDD with adversarially-derived edge-case coverage.
