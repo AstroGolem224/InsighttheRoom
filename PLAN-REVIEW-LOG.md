@@ -343,3 +343,11 @@ R4 (2): assertThread into ArCorePlane getters + subsumedBy; row-stride overlap g
 R5: APPROVED.
 Two pure pieces (equality PlaneRegistry, stride-aware yuvToRgba) are JVM-TDD'd in :core; the ARCore glue
 compiles + is runtime-verified via a DATED device checklist.
+
+## Act 3 — Build Plan 3b — PASS
+Codex built Tasks 1-6; ARCore 1.43.0 API names compiled verbatim (no adjustments). `./gradlew
+:core:test :core-arcore:compileDebugKotlin` BUILD SUCCESSFUL. Deviation: byte literal 128 -> 128.toByte().
+Claude verified: fresh proof green (PlaneRegistry 4 + YuvToRgba 4 tests), PlaneRegistry uses equality
+HashMap (not IdentityHashMap), adapter never calls session.update() (comment only), mandatory
+SessionLifecycle + assertThread + getAllTrackables + Pending availability all present. :core-arcore
+compiles against real SceneView 2.2.1. Runtime = device checklist (PLAN3B-DEVICE-CHECKLIST.md).
