@@ -192,3 +192,27 @@ Round 4: **APPROVED** (one trivial comment fixed).
 Key fixes: `core.floorPlanFromStored(raw, storedSnappedCorners: List<Vec2>?, objects)` — explicit snap state, verbatim stored geometry, throws on corruption; `@Upsert` + explicit prior-room delete (no REPLACE cascade); `@Transaction loadBuildingAggregate`; ownership + contiguous-index + snapped-parity `require`s; `ScanStatus` draft state; top-level `ksp{}`; Robolectric 4.14.1 + `@Config(sdk=[34])`; real mid-transaction rollback test (duplicate PK).
 
 Rejected with reason (2): stable per-object DB ID (value-like v1 markers, no cross-session reference, would ripple through shipped Plan 1) — deferred to v2; moving Room DAO tests before the DAO/@Database declaration (impossible — KSP must generate the impl first; real red phase is behavioral).
+
+---
+
+# Act 3 — Build Plan 2 (Codex builds, Claude verifies)
+
+Model gpt-5.6-sol. THREAD 019f5af6-212d-7d00-b4e4-34361c70ed63.
+
+### Round 1 — Codex build
+Implemented Tasks 1–7 (core aggregate types + FloorPlanReconstruct, :persistence Room module).
+Room 2.6.1 + KSP 2.0.21-1.0.25 (KSP1, confirmed via KspTaskJvm) — no version bump needed.
+Report: 20 files, `./gradlew :core:test :persistence:testDebugUnitTest` BUILD SUCCESSFUL,
+74 tests (63 core + 11 persistence), 0 failures. Deviation: one backtick test name had a `;`
+(illegal in Kotlin identifiers) changed to `and`; body unchanged.
+
+### Claude's verdict — PASS (0 fix rounds)
+Verified independently:
+- Ran `./gradlew :core:test :persistence:testDebugUnitTest --rerun-tasks` myself → BUILD
+  SUCCESSFUL, all suites 0 failures / 0 errors (fresh, not cached).
+- Read the diff: FloorPlanReconstruct (explicit storedSnappedCorners?, throws on corrupt),
+  Mappers.toDomain (null-vs-list + requireContiguous), ScanDao (@Upsert, ownership +
+  contiguous-index + snapped-parity guards, deleteRoomsForBuilding, @Transaction
+  loadBuildingAggregate) — all faithful to the 4-round-approved plan.
+- ksp{} is top-level; Plan-1 core geometry files unchanged (empty diff); no forbidden deps.
+Faithful, clean, no scope creep. 7 local commits, not pushed — awaiting human sign-off.
