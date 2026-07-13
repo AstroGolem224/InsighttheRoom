@@ -248,3 +248,19 @@ pipeline (terminal outcomes, atomic apply, monotonic revisions, expiry), normali
 pure source-frame detector->floor projector + point-in-polygon room containment, floor selection with
 cycle-safe live subsumption + frozen reference plane, typed boundary (CameraImage, AvailabilityResult,
 DisplayPoint, copy-before-close snapshot). All pure Kotlin, JVM-TDD'd. Device adapter = Plan 3b.
+
+---
+
+# Act 3 — Build Plan 3 (Codex builds, Claude verifies)
+
+Model gpt-5.6-sol. Implemented Tasks 1–6 (pure-Kotlin AR logic in :core).
+Report: 12 files, `./gradlew :core:test` BUILD SUCCESSFUL, 112 tests (49 new AR), 0 failures.
+Deviation: 7 backtick test names had `;` (illegal in Kotlin identifiers) changed to `-`; logic unchanged.
+
+### Claude's verdict — PASS (0 fix rounds)
+Verified independently:
+- Ran `./gradlew :core:test --rerun-tasks` myself → BUILD SUCCESSFUL, all suites 0 failures (fresh).
+- AR test counts: ArLifecycle 11, FramePipeline 14, FloorSelection 7, Pose 6, Projection 7, ArBoundary 4.
+- Spot-checked: FramePipeline @Synchronized (10), projector finite guard, Plan-1 RoomBasis zAxis fix intact.
+- :core still has ZERO Android deps. :persistence / :spike untouched.
+Faithful to the 7-round-approved plan, clean, no scope creep.
