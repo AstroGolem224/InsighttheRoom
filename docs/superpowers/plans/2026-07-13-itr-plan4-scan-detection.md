@@ -220,10 +220,28 @@ class MarkerTrackerTest {
         assertEquals(1, t.candidates().size)
     }
 
-    @Test fun `two ADJACENT same-class chairs in ONE frame stay TWO tracks (one-to-one, no double-claim)`() {
+    @Test fun `two ADJACENT same-class chairs in ONE frame stay TWO tracks`() {
         val t = MarkerTracker()
         t.observeFrame(listOf(obs("chair", 0.10, 1.0, 0.7), obs("chair", 0.60, 1.4, 0.7)))   // non-overlapping boxes
         assertEquals(2, t.candidates().size)
+    }
+
+    @Test fun `one-to-one — two obs cannot both claim ONE existing track (second becomes a new track)`() {
+        val t = MarkerTracker()
+        t.observeFrame(listOf(obs("chair", 0.10, 1.0, 0.6)))            // seed ONE track
+        // two observations both overlapping/near the seeded track in a single frame
+        t.observeFrame(listOf(obs("chair", 0.11, 1.02, 0.9), obs("chair", 0.12, 1.03, 0.8)))
+        assertEquals(2, t.candidates().size)                           // one associates, the OTHER is a new track
+    }
+
+    @Test fun `two seeded tracks each take exactly one of two jointly-eligible observations`() {
+        val t = MarkerTracker()
+        t.observeFrame(listOf(obs("chair", 0.10, 1.0, 0.7)))           // track A near (1.0,1)
+        t.observeFrame(listOf(obs("chair", 0.60, 1.4, 0.7)))           // track B near (1.4,1)
+        assertEquals(2, t.candidates().size)
+        t.observeFrame(listOf(obs("chair", 0.11, 1.02, 0.9), obs("chair", 0.61, 1.42, 0.9)))
+        assertEquals(2, t.candidates().size)                           // no new tracks — each obs matched its own
+        assertTrue(t.candidates().all { it.observations == 2 })
     }
 
     @Test fun `markers() exposes only CONFIRMED; objectsResolved reflects remaining candidates`() {
@@ -522,6 +540,22 @@ class ScanAssemblyTest {
         val room = assembleRoom("r1","x", basis, corners.take(2), emptyList(), CeilingMeasurement.Skipped, false, finalized = true, 0L)
         assertTrue(!room.floorPlan.isValid); assertEquals(ScanStatus.DRAFT, room.status)
     }
+
+    @Test fun `a valid room drops out-of-room and non-finite markers (defensive filter)`() {
+        val markers = listOf(
+            RoomObject("in", Vec2(1.5,2.0), 0.9),          // inside 3x4 -> kept
+            RoomObject("out", Vec2(9.0,9.0), 0.9),          // outside -> dropped
+            RoomObject("nan", Vec2(Double.NaN,1.0), 0.9),   // non-finite -> dropped
+        )
+        val room = assembleRoom("r1","x", basis, corners, markers, CeilingMeasurement.Measured(2.5), false, true, 0L)
+        assertEquals(1, room.floorPlan.objects.size)
+        assertEquals("in", room.floorPlan.objects.first().label)
+    }
+
+    @Test fun `an invalid draft never retains a non-finite marker coordinate`() {
+        val room = assembleRoom("r1","x", basis, corners.take(2), listOf(RoomObject("nan", Vec2(Double.NaN,0.0), 0.5)), CeilingMeasurement.Skipped, false, true, 0L)
+        assertTrue(room.floorPlan.objects.none { !it.position.x.isFinite() || !it.position.z.isFinite() })
+    }
 }
 ```
 
@@ -579,8 +613,9 @@ fun assembleRoom(
   - Holds `ScanStage`, `FloorSelection` (+ its `RoomBasis`, locked after two eligible projected corners), the world corner taps, `MarkerTracker`, `FramePipeline`, `CeilingMeasurement`, a monotonically-increasing `basisRevision`.
   - **Corner tap:** `frame.hitTest(displayPoint)` → require `floorSelection.isHitEligible(hitPlane)` → **reject if the hit's signed distance to `floor.referencePlane` exceeds a named tolerance** (drift beyond the frozen plane) → project the hit onto `floor.referencePlane` → store the projected world point. Lock the `RoomBasis` once two eligible corners exist AND the projected first edge length ≥ the geometry min-edge (else keep tapping) — origin = first corner, normal = frozen reference normal, X = first→second projected edge.
   - **Detection (async → marshalled onto the AR frame thread via a queue):** worker completions are pushed to a thread-safe `ConcurrentLinkedQueue<PendingResult>` and **drained inside `onFrame`** (the exact adapter-bound AR frame thread — NOT `Handler(mainLooper)`, which may differ). Each AR frame: (1) drain the queue → for each pending, `val out = pipeline.completeApplying(record.id) { rec -> results.mapNotNull { placeDetection(rec, it.label, it.normalizedBox, it.confidence, floor.referencePlane, basis, plan.rawCorners) } }` (exactly ONE per record for the WHOLE list) and **pattern-match `ApplyOutcome`: only `Applied` → `tracker.observeFrame(out.value)`; every `Rejected` (stale/cancelled/expired/drained/unknown) is logged and ignored — no observation list reaches the tracker**. An EMPTY result is still `Applied([])` (a successful inference, not a failure); `fail(id)`/`cancel(id)` only for a THROWN/cancelled inference before completion. (2) `acquireSnapshot()` → `if (submissionsOpen && pipeline.submit(snapshot.record))` **only then** enqueue one inference on the **serial detector executor** (one MediaPipe call at a time — the `ObjectDetector` is not assumed thread-safe); if `submit` returns false or submissions are closed, discard the snapshot and enqueue NO callback. On a basis-defining edit: bump `basisRevision`, `pipeline.onBasisRevised(basisRevision)` (stales all in-flight — Plan 3's reusable API, NOT `shutdown()`), set `session.basisRevision` on the AR thread.
-  - **OBJECTS → REVIEW gate (`FINALIZING_OBJECTS`, non-blocking):** close submissions and enter `FINALIZING_OBJECTS`; keep processing `onFrame` queue drains each frame (do NOT block the AR thread) until `pipeline.inFlight() == 0`; THEN evaluate `tracker.objectsResolved()` atomically and advance to REVIEW. Reopen submissions if the user backs out to OBJECTS.
-  - **Pause (background) vs destroy:** on **background**, close submissions and `pipeline.onBasisRevised(rev)`-stale (or let records expire) the in-flight work, but KEEP the pipeline + detector so foreground resume works. Only on **terminal destroy** call `pipeline.shutdown()` and close the MediaPipe `ObjectDetector` — after the serial executor is quiescent (all workers finished).
+  - **Worker completion queue:** `PendingResult` is a sealed `Success(record, results)` / `Error(record)` / `Cancelled(record)`. `onFrame` drains each to EXACTLY one terminal call on the AR thread: `Success` → `completeApplying(record.id){…}` (then `ApplyOutcome.Applied` → `observeFrame`); `Error` → `pipeline.fail(record.id)`; `Cancelled` → `pipeline.cancel(record.id)`. So every submitted record terminalizes — `inFlight()` always drains.
+  - **OBJECTS → REVIEW gate (`FINALIZING_OBJECTS`, non-blocking):** close submissions, enter `FINALIZING_OBJECTS`; keep draining `onFrame` each frame (never block the AR thread) until `pipeline.inFlight() == 0`; THEN if `tracker.objectsResolved()` → REVIEW, ELSE **return to OBJECTS with submissions still closed** so the user resolves remaining candidates (reopen submissions only if scanning is resumed) — no dead-end.
+  - **Pause (background) vs destroy:** on **background**, close submissions and — on the AR thread — bump the controller revision to `newRev` and set BOTH `pipeline.onBasisRevised(newRev)` (strictly greater, so it won't throw) AND `session.basisRevision = newRev` (so resumed snapshots carry the current revision), but KEEP the pipeline + detector so foreground resume works. Only on **terminal destroy** call `pipeline.shutdown()` and close the MediaPipe `ObjectDetector` — after the serial executor is quiescent.
   - **Basis edit → markers (v1 destructive reset):** editing a basis-defining corner **clears the markers and returns to OBJECTS unconfirmed, with a user confirmation** (see the PLAN amendment). Atomic old→new-basis marker rebasing is a v2 item.
   - **Confirm/edit:** the OBJECTS stage drives `tracker.confirm/reject/relabel/move/split/merge`. The controller **validates a `move`/`split` target is finite AND inside `plan.rawCorners` (`pointInPolygon`) before calling the tracker**, surfacing an error to the user if not (assembly's out-of-room filter is only a defensive fallback). The FSM prerequisite `markersConfirmed` is `tracker.objectsResolved()` — never a free boolean.
   - **Finish:** `assembleRoom(..., markers = tracker.markers(), ceiling = ceilingMeasurement, finalized = true)` → wrap in a one-room `Building(id, name, listOf(room), now)` → `ScanRepository.saveBuilding(building)`.
