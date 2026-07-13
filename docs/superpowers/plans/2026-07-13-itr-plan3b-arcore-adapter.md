@@ -46,6 +46,14 @@ class PlaneRegistryTest {
         assertNotEquals(r.idFor(Handle(1)), r.idFor(Handle(2)))
     }
 
+    // hashCode collision but NOT equal -> must still get different ids (equality, not hashCode, decides)
+    private class Colliding(val n: Int) { override fun equals(o: Any?) = o is Colliding && o.n == n; override fun hashCode() = 0 }
+
+    @Test fun `hashCode-colliding but unequal handles get different ids`() {
+        val r = PlaneRegistry()
+        assertNotEquals(r.idFor(Colliding(1)), r.idFor(Colliding(2)))   // same hashCode 0, different equals
+    }
+
     @Test fun `ids are stable across interleaved lookups`() {
         val r = PlaneRegistry()
         val a = r.idFor(Handle(1)); r.idFor(Handle(2))
@@ -133,6 +141,16 @@ class YuvToRgbaTest {
         val rgba = yuvToRgba(2, 2, y, uv, uv, yRowStride = 2, uvRowStride = 4, uvPixelStride = 2)
         assertEquals(2 * 2 * 4, rgba.size)   // must not read the interleaved gaps as chroma
     }
+
+    @Test fun `honours Y row-stride padding (does not read padding bytes as pixels)`() {
+        // width 2, height 2, but each Y row is padded to 4 bytes; the 2 padding bytes are 0 (would be black)
+        val y = byteArrayOf(128, 128, 0, 0,  128, 128, 0, 0)   // rowStride 4, width 2
+        val u = byteArrayOf(128.toByte()); val v = byteArrayOf(128.toByte())
+        val rgba = yuvToRgba(2, 2, y, u, v, yRowStride = 4, uvRowStride = 2, uvPixelStride = 1)
+        assertEquals(2 * 2 * 4, rgba.size)
+        // every output pixel is grey ~128 — the 0 padding bytes must NOT have leaked in
+        for (px in 0 until 4) assertEquals(128, rgba[px * 4].toInt() and 0xFF)
+    }
 }
 ```
 
@@ -154,6 +172,8 @@ fun yuvToRgba(
     yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
 ): ByteArray {
     require(width > 0 && height > 0) { "non-positive dimensions" }
+    require(width.toLong() * height <= Int.MAX_VALUE / 4L) { "image too large" }
+    require(y.size >= (height - 1) * yRowStride + width) { "Y buffer too small for stride" }
     val out = ByteArray(width * height * 4)
     for (row in 0 until height) {
         val uvRow = (row / 2) * uvRowStride
@@ -279,21 +299,26 @@ class ArCoreFrame(
     private val registry: PlaneRegistry,
     private val frameId: Long,
     private val basisRevision: Int,
+    /** The EXACT transform Plan 4's detector preprocessing applies (crop/scale/rotation/mirror). The
+     *  default full-image identity is only correct if the detector consumes the unrotated CPU image. */
+    private val imageTransform: (CameraIntrinsics) -> ImageTransform = { k ->
+        ImageTransform(k.width, k.height, 0, 0, k.width, k.height, k.width, k.height, 0, false) },
+    private val viewWidth: Int = 0, private val viewHeight: Int = 0,   // active display geometry (0 = unset)
 ) : ArFrameRef {
     override val record: FrameRecord get() {
         val cam = frame.camera; val intr = cam.imageIntrinsics
         val f = intr.focalLength; val pp = intr.principalPoint; val dim = intr.imageDimensions
-        // ImageTransform documents the CANONICAL image the detector consumes. Plan 4 owns the exact
-        // crop/rotation/mirror it applies to feed MediaPipe and passes the matching values here; the
-        // default below is the full unrotated CPU image (displayRotation 0). See Plan 4.
-        return FrameRecord(frameId, frame.timestamp, basisRevision, cam.pose.toAr(),
-            CameraIntrinsics(f[0].toDouble(), f[1].toDouble(), pp[0].toDouble(), pp[1].toDouble(), dim[0], dim[1]),
-            ImageTransform(dim[0], dim[1], 0, 0, dim[0], dim[1], dim[0], dim[1], 0, false))
+        val k = CameraIntrinsics(f[0].toDouble(), f[1].toDouble(), pp[0].toDouble(), pp[1].toDouble(), dim[0], dim[1])
+        return FrameRecord(frameId, frame.timestamp, basisRevision, cam.pose.toAr(), k, imageTransform(k))
     }
     override val trackingOk: Boolean get() = frame.camera.trackingState == TrackingState.TRACKING
     override fun currentPlanes(): List<ArPlaneRef> =
         session.getAllTrackables(ArcPlane::class.java).map { ArCorePlane(it, registry) }   // full current set
     override fun hitTest(point: DisplayPoint): Pair<ArPlaneRef, Vec3>? {
+        // the tap's view geometry MUST match the geometry set via setDisplayGeometry, else the hit is wrong
+        require(viewWidth == 0 || (point.viewWidth == viewWidth && point.viewHeight == viewHeight)) {
+            "DisplayPoint view ${point.viewWidth}x${point.viewHeight} != active geometry ${viewWidth}x$viewHeight"
+        }
         for (h in frame.hitTest(point.x.toFloat(), point.y.toFloat())) {
             val tr = h.trackable
             if (tr is ArcPlane && tr.isPoseInPolygon(h.hitPose)) {
@@ -313,31 +338,53 @@ package itr.corearcore
 
 import android.content.Context
 import com.google.ar.core.ArCoreApk
-import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
-import com.google.ar.core.NotYetAvailableException
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import com.google.ar.core.exceptions.NotYetAvailableException   // 1.43.0: exceptions package
 import itr.core.ar.*
+
+/** Lifecycle callbacks the app wires to SceneView (which owns the real session lifecycle). */
+class SessionLifecycle(val onResume: () -> Unit = {}, val onPause: () -> Unit = {}, val onClose: () -> Unit = {})
 
 /**
  * ArSessionRef over an ARCore session that SceneView OWNS. The app forwards SceneView's
- * onSessionUpdated(session, frame) to [onFrame]; every accessor reads the cached frame. This adapter
- * never calls session.update() and never resumes/pauses/closes the session (SceneView does).
- * Confined to the AR frame thread (SceneView's callback thread) — single-threaded by contract.
+ * onSessionUpdated(session, frame) to [onFrame], which stamps ONE id per frame; accessors read that
+ * cached frame + id. This adapter never calls session.update(); resume/pause/close DELEGATE to the
+ * SceneView-wired [lifecycle]. Confined to the AR frame thread — asserted on every mutating call.
  */
 class ArCoreSession(
     private val context: Context,
     private val session: Session,
+    private val lifecycle: SessionLifecycle = SessionLifecycle(),
+    private val imageTransform: (CameraIntrinsics) -> ImageTransform = { k ->
+        ImageTransform(k.width, k.height, 0, 0, k.width, k.height, k.width, k.height, 0, false) },
     private val registry: PlaneRegistry = PlaneRegistry(),
 ) : ArSessionRef {
+    private var thread: Thread? = null
     private var cached: Frame? = null
+    private var cachedId: Long = -1
+    private var snapshotTakenForId: Long = -1
     private var frameCounter = 0L
+    private var geomRotation = 0; private var geomW = 0; private var geomH = 0
     var basisRevision: Int = 0
+        set(v) { assertThread(); field = v }
 
-    /** Call from SceneView's onSessionUpdated. Also keep display geometry current via [onDisplayGeometry]. */
-    fun onFrame(frame: Frame) { cached = frame }
-    fun onDisplayGeometry(rotation: Int, widthPx: Int, heightPx: Int) = session.setDisplayGeometry(rotation, widthPx, heightPx)
+    private fun assertThread() {
+        val t = Thread.currentThread()
+        if (thread == null) thread = t
+        check(thread === t) { "ArCoreSession must be used from one thread (the AR frame thread)" }
+    }
+
+    /** Call from SceneView's onSessionUpdated — assigns exactly one id to this frame. */
+    fun onFrame(frame: Frame) { assertThread(); cached = frame; cachedId = frameCounter++ }
+
+    fun onDisplayGeometry(rotation: Int, widthPx: Int, heightPx: Int) {
+        assertThread()
+        require(widthPx > 0 && heightPx > 0) { "non-positive view size" }
+        geomRotation = rotation; geomW = widthPx; geomH = heightPx      // rotation is a Surface.ROTATION_* constant
+        session.setDisplayGeometry(rotation, widthPx, heightPx)
+    }
 
     override fun availability(): AvailabilityResult = when (ArCoreApk.getInstance().checkAvailability(context)) {
         ArCoreApk.Availability.SUPPORTED_INSTALLED -> AvailabilityResult.Supported
@@ -349,24 +396,28 @@ class ArCoreSession(
         ArCoreApk.Availability.UNKNOWN_ERROR -> AvailabilityResult.CheckFailed
     }
 
-    override fun resume() { /* no-op: SceneView owns lifecycle */ }
-    override fun pause() { /* no-op */ }
-    override fun close() { /* no-op: SceneView owns the session */ }
+    override fun resume() = lifecycle.onResume()     // delegate to SceneView owner
+    override fun pause() = lifecycle.onPause()
+    override fun close() = lifecycle.onClose()
 
-    override fun latestFrame(): ArFrameRef? =
-        cached?.let { ArCoreFrame(it, session, registry, frameCounter++, basisRevision) }
+    override fun latestFrame(): ArFrameRef? {
+        assertThread()
+        return cached?.let { ArCoreFrame(it, session, registry, cachedId, basisRevision, imageTransform, geomW, geomH) }
+    }
 
     override fun acquireSnapshot(): FrameSnapshot? {
+        assertThread()
         val frame = cached ?: return null
+        if (cachedId == snapshotTakenForId) return null                 // at most one snapshot per frame
         if (frame.camera.trackingState != TrackingState.TRACKING) return null
-        val rec = ArCoreFrame(frame, session, registry, frameCounter++, basisRevision).record
+        val rec = ArCoreFrame(frame, session, registry, cachedId, basisRevision, imageTransform, geomW, geomH).record
         val img = try { frame.acquireCameraImage() } catch (e: NotYetAvailableException) { return null }
         try {
             val p = img.planes   // Y, U, V
-            val rgba = itr.core.ar.yuvToRgba(
-                img.width, img.height,
+            val rgba = itr.core.ar.yuvToRgba(img.width, img.height,
                 p[0].buffer.toBytes(), p[1].buffer.toBytes(), p[2].buffer.toBytes(),
                 p[0].rowStride, p[1].rowStride, p[1].pixelStride)
+            snapshotTakenForId = cachedId
             return FrameSnapshot(CameraImage(img.width, img.height, rgba), rec)   // pixels copied before close
         } finally { img.close() }
     }
