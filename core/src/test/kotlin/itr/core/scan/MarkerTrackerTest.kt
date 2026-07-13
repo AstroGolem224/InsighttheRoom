@@ -25,7 +25,7 @@ class MarkerTrackerTest {
         assertEquals(2, t.candidates().size)
     }
 
-    @Test fun `one-to-one — two obs cannot both claim ONE existing track, second becomes a new track`() {
+    @Test fun `one-to-one — two obs cannot both claim ONE existing track (second becomes a new track)`() {
         val t = MarkerTracker()
         t.observeFrame(listOf(obs("chair", 0.10, 1.0, 0.6)))            // seed ONE track
         // two observations both overlapping/near the seeded track in a single frame
