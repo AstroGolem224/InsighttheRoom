@@ -68,5 +68,14 @@ Local-only diagnostic log (opt-in): pose/tracking-quality state, plane revisions
 - **SceneView-Android version churn:** young library; pinned + dependency verification, watch breaking changes.
 - **UI/UX not yet designed** — deferred to the next step per the user; this plan covers architecture, deliverables, and integration contracts only.
 
+## UI / UX (v1)
+Material 3 (Material You dynamic color), light + dark, technical-clean floorplan (thin wall lines, cm/mm dimensions, furniture as labeled points). **4 top-level screens:**
+1. **Home / list** — saved scans as cards (floorplan thumbnail, area, object count); FAB "Neuer Scan". One `Building` = one room in v1.
+2. **Scan wizard** — guided, one goal per stage, mapping 1:1 to the ARCore state machine: (1) floor select + confirm → (2) tap corners in order (live edge length, undo) → (3) ceiling height (two-point or numeric) → (4) furniture scan (detect + confirm/reposition/relabel markers) → (5) review. Wizard structure minimizes AR error states; expert/freeform mode = v2.
+3. **Floorplan detail** — finished plan: polygon, per-wall dimensions, area, furniture markers; edit markers (drag/delete/relabel), export (PNG/SVG via FileProvider share).
+4. **Settings** — units (metric/imperial), Manhattan-snap default toggle, opt-in diagnostic log, sanitized-export trigger, "About" + accuracy disclaimer.
+
+Themes beyond default Material 3 (e.g. blueprint skin), onboarding tutorial = v2.
+
 ## Out of scope (v1)
 Photo/video import & photogrammetry (COLMAP/RoomFormer); multi-room building stitching; optimization/redesign suggestions; auto panorama→floorplan (HorizonNet); footprint/3D object boxes; CAD/BIM export (PDF/glTF/IFC); iOS; cloud/backend/accounts/sync; custom-trained classes beyond MediaPipe COCO; **full ARCore-recording debug bundle** (the small sanitized diagnostic export stays in v1 scope).
