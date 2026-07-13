@@ -168,6 +168,7 @@ androidx-activity-compose = { module = "androidx.activity:activity-compose", ver
 androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycleCompose" }
 androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycleCompose" }
 compose-material3 = { module = "androidx.compose.material3:material3", version.ref = "material3" }
+material-components = { module = "com.google.android.material:material", version = "1.12.0" }   # XML theme parent only
 coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }   # reuse existing
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
@@ -241,14 +242,20 @@ class SettingsRepositoryTest {
 
     @Test fun `defaults, then a change persists to disk (reopened via a fresh DataStore)`() = runTest {
         val f = file()
-        val scope1 = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Job())
+        val job1 = kotlinx.coroutines.SupervisorJob()
+        val scope1 = kotlinx.coroutines.CoroutineScope(job1 + kotlinx.coroutines.Dispatchers.IO)
         val ds1 = PreferenceDataStoreFactory.create(scope = scope1) { f }
         val repo = SettingsRepository(ds1)
         assertEquals(AppSettings.DEFAULT, repo.get())
         repo.setUnits(Units.IMPERIAL); repo.setSnap(false); repo.setDiagnosticLog(true)
-        scope1.cancel()                                     // close the first DataStore over this file
-        val ds2 = PreferenceDataStoreFactory.create { f }   // reopen the SAME file with a new DataStore
+        job1.cancelAndJoin()                                // FULLY terminate the first DataStore before reopening —
+                                                            // a bare cancel() is async and races the "one active
+                                                            // DataStore per file" guard, re-triggering the exact crash.
+        val job2 = kotlinx.coroutines.SupervisorJob()
+        val scope2 = kotlinx.coroutines.CoroutineScope(job2 + kotlinx.coroutines.Dispatchers.IO)
+        val ds2 = PreferenceDataStoreFactory.create(scope = scope2) { f }   // reopen the SAME file
         assertEquals(AppSettings(Units.IMPERIAL, snapByDefault = false, diagnosticLog = true), SettingsRepository(ds2).get())
+        job2.cancelAndJoin()
     }
 }
 ```
@@ -257,8 +264,9 @@ class SettingsRepositoryTest {
 
 - [ ] **Step 3: `AppModule`** (`@Module @InstallIn(SingletonComponent::class)`) provides:
   - `@Singleton DataStore<Preferences>` over the app's `settings.preferences_pb` (single instance).
-  - `@Singleton ItrDatabase` (Room.databaseBuilder) → `ScanDao` → a `@Singleton ScanStore` **adapter** wrapping `ScanRepository` (`ScanStore` is the app-side interface the ViewModels depend on — see Task 5 — so they're fakeable; `ScanRepository` is a concrete final class).
-  - `ArCoreSessionFactory` and `DetectorFactory` (see Task 5) — **factories, not instances**: the AR `Session` and the `Detector` are created per scan, bound to the scan screen's `ARSceneView`, and destroyed with it. They are NOT provided as singletons.
+  - `@Singleton ItrDatabase` (Room.databaseBuilder) → `ScanDao` → a `@Singleton ScanStore` **adapter** wrapping `ScanRepository` (`ScanStore` is the app-side interface the ViewModels depend on — see Task 5 — so they're fakeable; `ScanRepository` is a concrete final class). Provided via `@Provides @Singleton fun scanStore(repo: ScanRepository): ScanStore = ScanRepositoryStore(repo)`.
+  - **`SettingsSource` binding** — the Home VM injects the `SettingsSource` interface, which Hilt cannot infer from the concrete `SettingsRepository`. Add `@Provides @Singleton fun settingsSource(repo: SettingsRepository): SettingsSource = repo` (so `SettingsRepository` implements `SettingsSource`).
+  - **`ScanControllerFactory`** (see Task 5) — a plain injectable class, NOT a singleton instance of a controller: `@Singleton class ScanControllerFactory @Inject constructor(@ApplicationContext private val ctx: Context) { fun create(session: Session, lifecycle: SessionLifecycle, imageTransform: ImageTransform): ScanController { val detector = Detector(ctx); val arSession = ArCoreSession(session, lifecycle); return ScanController(arSession, detector, imageTransform) } }`. It creates **one `Detector` + one `ArCoreSession` per `create()` call** (per scan), bound to the scan screen's `ARSceneView` and destroyed with the controller. The factory is a singleton; the AR `Session`/`Detector` it builds are NOT. Provided by its `@Inject` constructor (no `@Provides` needed); injected into the scan route.
 
 - [ ] **Step 4: Run to green** — `./gradlew :app:testDebugUnitTest --tests "itr.app.SettingsRepositoryTest"`.
 
@@ -269,9 +277,14 @@ class SettingsRepositoryTest {
 ### Task 5: Home ViewModel + Compose navigation & screens (compile-verified)
 
 **Files:**
-- Create: `app/src/main/kotlin/itr/app/HomeViewModel.kt`
+- Create: `app/src/main/kotlin/itr/app/ScanStore.kt` (interface), `ScanRepositoryStore.kt` (adapter)
+- Create: `app/src/main/kotlin/itr/app/SettingsSource.kt` (interface; `SettingsRepository` from Task 4 is modified to implement it)
+- Create: `app/src/main/kotlin/itr/app/HomeViewModel.kt`, `DetailViewModel.kt`, `SettingsViewModel.kt`
+- Create: `app/src/main/kotlin/itr/app/di/ScanControllerFactory.kt` (assisted factory building `Detector` + `ArCoreSession` + `ScanController` per scan)
 - Create: `app/src/main/kotlin/itr/app/MainActivity.kt`, `Nav.kt`, `HomeScreen.kt`, `SettingsScreen.kt`, `DetailScreen.kt`
-- Test: `app/src/test/kotlin/itr/app/HomeViewModelTest.kt`
+- Modify: `app/src/main/kotlin/itr/app/di/AppModule.kt` (Task 4) — add `scanStore`, `settingsSource` provides; `ScanControllerFactory` is `@Inject`-constructed
+- Modify: `feature-scan/src/main/kotlin/itr/scan/ScanWizardScreen.kt` — take `createController: (Session, SessionLifecycle) -> ScanController` lambda instead of a pre-built controller (breaks the app↔feature-scan cycle)
+- Test: `app/src/test/kotlin/itr/app/HomeViewModelTest.kt`, `app/src/test/kotlin/itr/app/MainDispatcherRule.kt`
 
 - [ ] **Step 1: `ScanStore` interface + failing Home VM test** (fake store — the VM depends on the interface, not the concrete `ScanRepository`)
 
@@ -314,6 +327,8 @@ class HomeViewModelTest {
     }
     private class FakeSettings(var units: Units) : SettingsSource { override suspend fun units() = units }
 
+    @get:org.junit.Rule val mainRule = MainDispatcherRule()   // sets Dispatchers.Main to the test scheduler
+
     @Test fun `the ViewModel refresh() publishes rows and reflects a newly-saved scan`() = runTest {
         val store = FakeStore(listOf(building("a")))
         val vm = HomeViewModel(store, FakeSettings(Units.METRIC))
@@ -332,17 +347,25 @@ class HomeViewModelTest {
         assertEquals("43.06 ft²", vm.rows.value.first().areaText)   // 4 m²
     }
 }
+
+// MainDispatcherRule.kt (test util): sets Dispatchers.Main to a StandardTestDispatcher so
+// viewModelScope.launch runs under the test scheduler.
+class MainDispatcherRule(private val d: kotlinx.coroutines.test.TestDispatcher = kotlinx.coroutines.test.StandardTestDispatcher())
+    : org.junit.rules.TestWatcher() {
+    override fun starting(desc: org.junit.runner.Description) { kotlinx.coroutines.Dispatchers.setMain(d) }
+    override fun finished(desc: org.junit.runner.Description) { kotlinx.coroutines.Dispatchers.resetMain() }
+}
 ```
-> `HomeViewModel(store: ScanStore, settings: SettingsSource)` — `SettingsSource` is a tiny interface (`suspend fun units(): Units`) the real `SettingsRepository` implements, so the VM is faked without Android. `refresh()` = `_rows.value = loadHomeRows(store.list(), settings.units())`; `rows` is the read-only `StateFlow`. Import `kotlinx.coroutines.test.runCurrent`. `loadHomeRows(buildings, units) = buildings.map { homeRow(it, units) }` is the pure helper.
+> `HomeViewModel(store: ScanStore, settings: SettingsSource)` — `SettingsSource` is a tiny interface (`suspend fun units(): Units`) the real `SettingsRepository` implements, so the VM is faked without Android. `store.list()`/`settings.units()` are **suspend**, so `refresh()` is a plain (non-suspend) fun that launches: `fun refresh() { job?.cancel(); job = viewModelScope.launch { _rows.value = loadHomeRows(store.list(), settings.units()) } }` (cancels any in-flight refresh so rapid resumes don't interleave). `rows` is the read-only `StateFlow`. Tests set `Dispatchers.Main` via `MainDispatcherRule` (below) and `runCurrent()` to advance the launched job. `loadHomeRows(buildings, units) = buildings.map { homeRow(it, units) }` is the pure helper.
 
-- [ ] **Step 2: Run red, implement** `loadHomeRows` + `HomeViewModel(store: ScanStore, settings: SettingsSource)` (exposes `val rows: StateFlow<List<HomeRow>>`; `fun refresh()` = `_rows.value = loadHomeRows(store.list(), settings.units())`). `SettingsSource` (`suspend fun units(): Units`) is implemented by `SettingsRepository`. The Home screen calls `refresh()` via **`LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refresh() }`** (a plain `LaunchedEffect` reading `currentState` would NOT rerun on resume) so a scan saved and popped back re-loads (v1 trigger; a Room `Flow` is v2). `ScanStore` adapter (with `save`): `class ScanRepositoryStore(private val repo: ScanRepository): ScanStore { override suspend fun list() = repo.listBuildings(); override suspend fun load(id) = repo.loadBuilding(id); override suspend fun save(b) = repo.saveBuilding(b); override suspend fun delete(id) = repo.deleteBuilding(id) }`.
+- [ ] **Step 2: Run red, implement** `loadHomeRows` + `HomeViewModel(store: ScanStore, settings: SettingsSource)` (exposes `val rows: StateFlow<List<HomeRow>>` backed by a private `MutableStateFlow`; `fun refresh() { job?.cancel(); job = viewModelScope.launch { _rows.value = loadHomeRows(store.list(), settings.units()) } }` — non-suspend, launches because `list()`/`units()` are suspend). `SettingsSource` (`suspend fun units(): Units`) is implemented by `SettingsRepository`. The Home screen calls `refresh()` via **`LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refresh() }`** (a plain `LaunchedEffect` reading `currentState` would NOT rerun on resume) so a scan saved and popped back re-loads (v1 trigger; a Room `Flow` is v2). `ScanStore` adapter (with `save`): `class ScanRepositoryStore(private val repo: ScanRepository): ScanStore { override suspend fun list() = repo.listBuildings(); override suspend fun load(id) = repo.loadBuilding(id); override suspend fun save(b) = repo.saveBuilding(b); override suspend fun delete(id) = repo.deleteBuilding(id) }`.
 
-- [ ] **Step 3: Assisted factories + route-scoped lifecycle** (fixes the circular AR construction; **also MODIFY `feature-scan/.../ScanWizardScreen.kt`** to take a factory lambda, not a pre-built controller — an app-owned factory can't be referenced from `:feature-scan` without a dependency cycle). `ScanWizardScreen(createController: (Session, SessionLifecycle) -> ScanController, …)` OWNS the `ARSceneView`: creates the view, and only once the first `onSessionUpdated` supplies a live `Session` does it build the controller via `createController(session, lifecycle)` (a nullable `controller` state until then). The `:app` scan route passes `createController = { s, lc -> scanControllerFactory.create(s, lc, UnrotatedFullImageTransform) }`. **Controller lifecycle explicitly drives the session:** `onBackground` → `arSession.pause()`, `onForeground` → `arSession.resume()`, `destroy` → `arSession.close()` (these delegate to the wired `SessionLifecycle` which pauses/resumes/destroys the ARSceneView — the ONE owner, no double-close). A `LifecycleEventObserver` forwards ON_PAUSE/ON_RESUME to the controller (background = pause, NOT destroy). A `DisposableEffect(Unit)` on the route calls `controller.destroy()` on dispose. **`destroy()` must not block the UI thread:** `pipeline.shutdown()` + the detector-executor shutdown run **without `awaitTermination` on the caller** (fire the executor `shutdownNow()`/close on the background executor itself); only the thread-confined AR/view cleanup stays on the UI callback. Nothing AR-related is a Hilt singleton.
+- [ ] **Step 3: Assisted factories + route-scoped lifecycle** (fixes the circular AR construction; **also MODIFY `feature-scan/.../ScanWizardScreen.kt`** to take a factory lambda, not a pre-built controller — an app-owned factory can't be referenced from `:feature-scan` without a dependency cycle). `ScanWizardScreen(createController: (Session, SessionLifecycle) -> ScanController, …)` OWNS the `ARSceneView`: creates the view, and only once the first `onSessionUpdated` supplies a live `Session` does it build the controller via `createController(session, lifecycle)` (a nullable `controller` state until then). The `:app` scan route passes `createController = { s, lc -> scanControllerFactory.create(s, lc, UnrotatedFullImageTransform) }`. **Controller lifecycle explicitly drives the session:** `onBackground` → `arSession.pause()`, `onForeground` → `arSession.resume()`, `destroy` → `arSession.close()` (these delegate to the wired `SessionLifecycle` which pauses/resumes/destroys the ARSceneView — the ONE owner, no double-close). A `LifecycleEventObserver` forwards ON_PAUSE/ON_RESUME to the controller (background = pause, NOT destroy). A `DisposableEffect(Unit)` on the route calls `controller.destroy()` on dispose. **`destroy()` must not block the UI thread, and must not close MediaPipe mid-detection:** `pipeline.shutdown()`, then **submit `detector.close()` as the executor's FINAL queued task** and call ordinary `executor.shutdown()` (NOT `shutdownNow()` — that discards the queued close task and can race an in-flight detection). No `awaitTermination` on the UI caller. The close therefore runs on the background executor after the last detection drains; only the thread-confined AR/view cleanup stays on the UI callback. Nothing AR-related is a Hilt singleton.
 
 - [ ] **Step 4: Navigation + screens** — `Nav.kt` NavHost routes with concrete ViewModels:
   - `home` → `HomeViewModel` (rows StateFlow); cards → `detail/{id}`, FAB → `scan`.
   - `scan` → hosts `ScanWizardScreen` (assisted-factory wiring above); on finish it saved via `ScanRepository` and pops back to `home` (which refreshes).
-  - `detail/{id}` → `DetailViewModel(store, settings, savedStateHandle)` exposing `StateFlow<Building?>`; renders one `buildDisplayList(room.floorPlan, units)` → `FloorplanCanvas`; marker edit + export via `toSvg`/`renderPngBytes`/`shareExport`.
+  - `detail/{id}` → `DetailViewModel(store, settings, savedStateHandle)` exposing `StateFlow<Building?>`; renders one `buildDisplayList(room.floorPlan, units)` → `FloorplanCanvas`; export via `toSvg`/`renderPngBytes`/`shareExport`. **Marker edit persists by REBUILDING, not by copying `FloorPlan`** (which cannot be `copy`d wholesale and must not silently re-snap): `val fp = floorPlanFromStored(room.floorPlan.rawCorners, room.floorPlan.snappedCorners, editedObjects)` (stored geometry verbatim, only `objects` changed), then `val room2 = room.copy(floorPlan = fp)`, `val building2 = building.copy(rooms = building.rooms.map { if (it.id == room2.id) room2 else it })`, `store.save(building2)`, then `refresh()`.
   - `settings` → `SettingsViewModel(settingsRepository)` exposing `StateFlow<AppSettings>`; toggles call `setUnits/setSnap/setDiagnosticLog`.
   - `MainActivity` = `@AndroidEntryPoint ComponentActivity` hosting the NavHost with the app theme.
 
