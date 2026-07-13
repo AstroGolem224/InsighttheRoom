@@ -216,3 +216,35 @@ Verified independently:
   loadBuildingAggregate) — all faithful to the 4-round-approved plan.
 - ksp{} is top-level; Plan-1 core geometry files unchanged (empty diff); no forbidden deps.
 Faithful, clean, no scope creep. 7 local commits, not pushed — awaiting human sign-off.
+
+---
+
+# Plan 3 (AR logic, pure Kotlin) — Codex review, 7 rounds → APPROVED
+
+Original combined "core-arcore" plan split into Plan 3 (pure JVM-testable AR logic) + Plan 3b
+(device-bound ARCore adapter). Finding trajectory on the pure-logic plan: 29 → 18 → 13 → 8 → 5 → 5 → 0.
+
+Round 1 (29): lifecycle resume==tracking bug, mid-session permission-loss ignored, no session-creation
+phase, ERROR too coarse; pipeline single-thread claim vs async, no timeout/cancel/shutdown, duplicate
+ids overwrite, null-swallowing; floor eligibility breaks when confirmed root subsumed, resolveRoot
+infinite-loops on cycle, hashCode identity; adapter was TODO stubs; quaternion non-unit; coordinate
+spaces undefined.
+Round 2 (18): StaleRevision unreachable, HashMap eviction, fail/cancel indistinguishable, ApplyOutcome,
+latch atomicity test, quaternion overflow, floor tracking/type checks, ImageTransform detail, the pure
+projector, typed CameraImage, availability result, teardown effects.
+Round 3 (13): 90/270 rotation math bug, out-of-range test point, unvalidated intrinsics, YUV ambiguity,
+mutable CameraImage array, latch data race, exhaustive-table-is-only-totality, SessionCreateFailed no
+teardown, both-roots eligibility, hitToFloor-vs-projector conflict, projector containment.
+Round 4 (8): projector finite/principal-point validation, crop/size Int overflow, timestamp domain,
+DisplayPoint/selectFloorCandidate validation, real transition table, canonical-image contract.
+Round 5 (5): pointInPolygon boundary, FrameSnapshot dim match, RGBA Long overflow, expire nowNs guard,
+projector doc.
+Round 6 (5): clock-domain wording, projector validation tests, FrameSnapshot mismatch test, stale doc,
+Task-5 file list.
+Round 7: APPROVED (one KDoc reference fixed).
+
+Result: full lifecycle FSM (exhaustive allowed-transition table + teardown effects), thread-safe frame
+pipeline (terminal outcomes, atomic apply, monotonic revisions, expiry), normalized quaternion + pose,
+pure source-frame detector->floor projector + point-in-polygon room containment, floor selection with
+cycle-safe live subsumption + frozen reference plane, typed boundary (CameraImage, AvailabilityResult,
+DisplayPoint, copy-before-close snapshot). All pure Kotlin, JVM-TDD'd. Device adapter = Plan 3b.
