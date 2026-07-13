@@ -351,3 +351,28 @@ Claude verified: fresh proof green (PlaneRegistry 4 + YuvToRgba 4 tests), PlaneR
 HashMap (not IdentityHashMap), adapter never calls session.update() (comment only), mandatory
 SessionLifecycle + assertThread + getAllTrackables + Pending availability all present. :core-arcore
 compiles against real SceneView 2.2.1. Runtime = device checklist (PLAN3B-DEVICE-CHECKLIST.md).
+
+---
+
+# Plan 4 (scan wizard + detection) — Codex review, 6 rounds → APPROVED
+Trajectory: 18 → 17 → 10 → 8 → 6 → 0. The integration capstone; hardest plan.
+R1 (18): FSM too weak; ceiling skip vs DRAFT; tracker proximity-only merges adjacent chairs (needs
+class+IoU+3D+history); no confirmation; editing can't wire; placement/containment hand-waved; corner
+capture ignores isHitEligible/tolerance/frozen-plane; basis creation/rebasing undefined; completeApplying
+per-detection loses all but one; pipeline terminals incomplete; threading unspecified; detector TODO hides
+coordinate design; RoomBasis imported from wrong package; missing export deps; saveBuilding takes Building.
+R2 (17): tracker not one-to-one per frame; Detection interface undefined; placement box/point inconsistency;
+unvalidated tracker inputs; unstable move; meaningless split/merge; Ceiling.Measured unvalidated; floor
+tolerance absent; basis min-edge; basis edit clears vs rebase; drain undefined; empty result misclassified;
+backpressure ambiguous; image contract conflict; objectsResolved unchecked boolean.
+R3 (10): manual-move duplicate bug; greedy not optimal bipartite; edit APIs inject invalid data; merge
+doesn't combine history; zero-confidence div-by-zero; confirmation gate races; detector shutdown; post-back
+mechanism; image contract vs Plan 3; out-of-range boxes fail frame.
+R4 (8): assembly filter wrong on invalid poly; OBJECTS drain not operational; Rejected outcomes reach tracker;
+background uses permanent shutdown; detector concurrency; NaN box; edit containment; Plan 3 message.
+R5 (6): pause revision must strictly increase; worker failures deadlock FINALIZING; no false-result transition;
+Plan 3 doc message; one-to-one test insufficient; assembly filter untested.
+R6: APPROVED.
+Pure JVM-TDD'd: wizard FSM, validated ceiling, best-edge multi-object tracker (auto/display position,
+candidate/confirmed, stable-id editing), pure placeDetection (project->room-local->containment), assembly.
+Glue (MediaPipe detector, controller threading, Compose wizard) = compile + DATED device checklist.
