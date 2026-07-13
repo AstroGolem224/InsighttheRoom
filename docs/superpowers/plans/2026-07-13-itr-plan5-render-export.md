@@ -1,17 +1,5 @@
 # ItR Plan 5 — Floorplan render (display list) + export (SVG/PNG)
 
-> **STATUS (2026-07-13): DRAFT — mid Codex round-2 revision, NOT yet approved or built.**
-> Round-1 (32 findings) fully incorporated. Round-2 (16 findings) partially applied: shared
-> `RenderTransform` + `validateForRender` + `sanitizeLabel` (in `core/render/DisplayList.kt`),
-> shoelace-centroid fallback, imperial scale bar 0.3048 m, and the SVG serializer now use the shared
-> transform. **Still to apply before Codex re-review + build:** (a) update `renderPng` to use
-> `RenderTransform` (currently inline sx/sy); (b) `DisplayListTest` — assert exact L-centroid + a
-> concave-outside fallback case + `isSnapApplied` on the snapped regression; (c) `PngTest` — decode +
-> assert a dark wall pixel and a white background pixel (native graphics); (d) `Sharing` — derive MIME
-> from the extension, move tests before impl; (e) add a bundled font + a cross-renderer geometry/style
-> golden test, and amend the spec's render bullet to scope per-renderer text-measurement adapters to v2.
-> Then resume Codex review from round 3 on this file.
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** One platform-neutral floorplan **display list** in pure-Kotlin `:core` (walls, per-wall dimensions, area label, furniture markers, a scale bar — with shared style constants and metric/imperial formatting), consumed identically by a Compose Canvas view (`:floorplan`), an SVG exporter (`export-core`, pure, XML-escaped), and a PNG exporter (`export-android`, Bitmap→PNG bytes + FileProvider share). Geometry and style come from the single list, so the interactive view and both exports never diverge.
@@ -96,6 +84,7 @@ object RenderStyle {
     const val markerLabelDx: Float = 6f     // label offset right of a marker
     const val scaleLabelDy: Float = 14f     // scale-bar label offset below the bar
     const val maxLabelChars: Int = 128      // labels are capped ONCE in the display list
+    const val fontFamily: String = "sans-serif"   // all renderers use the same generic family (v1)
 
     /** ARGB long -> "#RRGGBB" for SVG (alpha dropped; v1 fills are opaque). */
     fun svgHex(argb: Long): String = "#%06X".format((argb and 0xFFFFFF))
@@ -164,10 +153,11 @@ class CentroidTest {
         assertEquals(1.5, c.x, 1e-9); assertEquals(2.0, c.z, 1e-9)
     }
 
-    @Test fun `concave L-shape centroid lies inside the polygon`() {
+    @Test fun `concave L-shape has the exact shoelace centroid (not the vertex mean)`() {
         val l = listOf(Vec2(0.0,0.0), Vec2(2.0,0.0), Vec2(2.0,1.0), Vec2(1.0,1.0), Vec2(1.0,2.0), Vec2(0.0,2.0))
         val c = polygonCentroid(l)
-        assertEquals(true, pointInPolygon(c, l))   // vertex mean would fall in the notch; shoelace stays inside
+        assertEquals(5.0/6.0, c.x, 1e-9); assertEquals(5.0/6.0, c.z, 1e-9)   // vertex mean is (1,1)
+        assertEquals(true, pointInPolygon(c, l))
     }
 }
 ```
@@ -244,6 +234,15 @@ class DisplayListTest {
         assertEquals("ok", dl.commands.filterIsInstance<DrawCmd.Marker>().first().label)
     }
 
+    @Test fun `the area label is strictly inside even a concave room (interior-point fallback)`() {
+        // U-shape: shoelace centroid falls in the notch (outside) -> fallback must find an interior point
+        val u = itr.core.geometry.buildFloorPlan(
+            listOf(Vec2(0.0,0.0), Vec2(3.0,0.0), Vec2(3.0,3.0), Vec2(2.0,3.0), Vec2(2.0,1.0), Vec2(1.0,1.0), Vec2(1.0,3.0), Vec2(0.0,3.0)),
+            emptyList(), snapped = false)
+        val at = buildDisplayList(u, Units.METRIC).commands.filterIsInstance<DrawCmd.AreaLabel>().first().at
+        assertTrue(itr.core.geometry.pointInPolygon(at, u.corners))
+    }
+
     @Test fun `bounds enclose corners AND markers`() {
         val dl = buildDisplayList(plan(listOf(RoomObject("x", Vec2(3.5, -0.5), 0.9))), Units.METRIC)
         assertTrue(dl.boundsMin.x <= -0.0 && dl.boundsMin.z <= -0.5)
@@ -253,9 +252,11 @@ class DisplayListTest {
     @Test fun `snapped plan renders from corners not rawCorners (regression)`() {
         val wobbly = buildFloorPlan(
             listOf(Vec2(0.0,0.0), Vec2(3.02,0.03), Vec2(2.98,4.01), Vec2(0.01,3.99)), emptyList(), snapped = true)
-        val dl = buildDisplayList(wobbly, Units.METRIC)
-        val firstWall = dl.commands.filterIsInstance<DrawCmd.Wall>().first()
-        assertEquals(wobbly.corners[0], firstWall.a)     // display uses snapped corners
+        assertTrue(wobbly.isSnapApplied)                       // the snap actually applied
+        assertTrue(wobbly.corners != wobbly.rawCorners)        // and moved the geometry
+        val walls = buildDisplayList(wobbly, Units.METRIC).commands.filterIsInstance<DrawCmd.Wall>()
+        assertEquals(wobbly.corners[0], walls.first().a)       // display uses SNAPPED corners
+        assertEquals(wobbly.corners[1], walls.first().b)
     }
 }
 ```
@@ -271,6 +272,7 @@ Expected: FAIL — unresolved.
 package itr.core.render
 
 import itr.core.geometry.Vec2
+import itr.core.geometry.pointInPolygon
 import itr.core.geometry.polygonCentroid
 import itr.core.model.FloorPlan
 
@@ -300,16 +302,25 @@ fun sanitizeLabel(s: String): String {
     return sb.toString()
 }
 
-/** The ONE coordinate mapping every renderer uses (SVG/PNG/Compose) — parity is structural. */
+/**
+ * The ONE coordinate mapping every renderer uses (SVG/PNG/Compose). Coordinates are QUANTIZED to 0.1 px
+ * so all three renderers consume byte-identical numbers (geometry parity, not just style). Guards the
+ * transformed dimensions against an absurd size before the Int conversion.
+ */
 class RenderTransform(private val dl: DisplayList, val pxPerMetre: Double, val pad: Double = RenderStyle.paddingPx.toDouble()) {
     init {
         require(pxPerMetre.isFinite() && pxPerMetre > 0) { "pxPerMetre must be finite and > 0" }
         dl.validateForRender()
+        val wD = (dl.boundsMax.x - dl.boundsMin.x) * pxPerMetre + 2 * pad
+        val hD = (dl.boundsMax.z - dl.boundsMin.z) * pxPerMetre + 2 * pad
+        require(wD <= MAX_DIM && hD <= MAX_DIM) { "render dimensions too large: ${wD}x${hD} (max $MAX_DIM)" }
     }
-    fun x(worldX: Double) = (worldX - dl.boundsMin.x) * pxPerMetre + pad
-    fun y(worldZ: Double) = (worldZ - dl.boundsMin.z) * pxPerMetre + pad   // Z -> Y down (room convention)
+    private fun q(v: Double) = kotlin.math.round(v * 10.0) / 10.0   // 0.1 px quantum, shared by all renderers
+    fun x(worldX: Double) = q((worldX - dl.boundsMin.x) * pxPerMetre + pad)
+    fun y(worldZ: Double) = q((worldZ - dl.boundsMin.z) * pxPerMetre + pad)   // Z -> Y down (room convention)
     val widthPx = kotlin.math.ceil((dl.boundsMax.x - dl.boundsMin.x) * pxPerMetre + 2 * pad).toInt().coerceAtLeast(1)
     val heightPx = kotlin.math.ceil((dl.boundsMax.z - dl.boundsMin.z) * pxPerMetre + 2 * pad).toInt().coerceAtLeast(1)
+    companion object { const val MAX_DIM = 20000.0 }
 }
 
 /** Validate bounds + every command's coordinates are finite (a public DisplayList could be malformed). */
@@ -319,12 +330,29 @@ fun DisplayList.validateForRender() {
     commands.forEach { c ->
         when (c) {
             is DrawCmd.Wall -> require(c.a.finite() && c.b.finite()) { "non-finite wall" }
-            is DrawCmd.Dimension -> require(c.a.finite() && c.b.finite()) { "non-finite dimension" }
-            is DrawCmd.Marker -> require(c.at.finite()) { "non-finite marker" }
-            is DrawCmd.AreaLabel -> require(c.at.finite()) { "non-finite area label" }
-            is DrawCmd.ScaleBar -> require(c.origin.finite() && c.lengthM.isFinite() && c.lengthM >= 0) { "bad scale bar" }
+            is DrawCmd.Dimension -> { require(c.a.finite() && c.b.finite()) { "non-finite dimension" }; requireSanitized(c.text) }
+            is DrawCmd.Marker -> { require(c.at.finite()) { "non-finite marker" }; requireSanitized(c.label) }
+            is DrawCmd.AreaLabel -> { require(c.at.finite()) { "non-finite area label" }; requireSanitized(c.text) }
+            is DrawCmd.ScaleBar -> { require(c.origin.finite() && c.lengthM.isFinite() && c.lengthM >= 0) { "bad scale bar" }; requireSanitized(c.label) }
         }
     }
+}
+
+// enforce sanitize-once: a directly-constructed DisplayList with a raw/illegal/oversized label is rejected
+private fun requireSanitized(label: String) = require(label == sanitizeLabel(label)) { "label not sanitized: renderers require sanitizeLabel()" }
+
+/** A point guaranteed strictly inside a simple polygon: the shoelace centroid, else the first
+ *  triangle-centroid of a consecutive vertex triple that lies inside (a concave-safe fallback). */
+fun interiorLabelPoint(corners: List<Vec2>): Vec2 {
+    val c = polygonCentroid(corners)
+    if (pointInPolygon(c, corners)) return c
+    val n = corners.size
+    for (i in 0 until n) {
+        val a = corners[i]; val b = corners[(i + 1) % n]; val d = corners[(i + 2) % n]
+        val tri = Vec2((a.x + b.x + d.x) / 3, (a.z + b.z + d.z) / 3)
+        if (pointInPolygon(tri, corners)) return tri
+    }
+    return c   // degenerate; caller's polygon was already validated so this is unreachable in practice
 }
 
 /** Build the single display list every renderer/exporter consumes. Empty for an invalid plan. */
@@ -338,14 +366,7 @@ fun buildDisplayList(plan: FloorPlan, units: Units): DisplayList {
     val markers = plan.objects.filter { it.position.finite() }   // drop non-finite positions
     markers.forEach { cmds += DrawCmd.Marker(it.position, sanitizeLabel(it.label)) }
 
-    // area label at the shoelace centroid, guaranteed inside (best-effort fallback for pathological rooms)
-    var labelAt = polygonCentroid(plan.corners)
-    if (!pointInPolygon(labelAt, plan.corners)) {
-        // ponytail: best-effort — mean, else first corner. Real (near-rectangular) rooms never hit this.
-        val mean = plan.corners.reduce { a, b -> a + b }.let { Vec2(it.x / plan.corners.size, it.z / plan.corners.size) }
-        labelAt = if (pointInPolygon(mean, plan.corners)) mean else plan.corners[0]
-    }
-    cmds += DrawCmd.AreaLabel(labelAt, sanitizeLabel(units.area(plan.areaM2)))
+    cmds += DrawCmd.AreaLabel(interiorLabelPoint(plan.corners), sanitizeLabel(units.area(plan.areaM2)))
 
     // scale bar: a real 1 m (metric) or 1 ft (imperial) reference so bar length matches its label
     val scaleLenM = if (units == Units.METRIC) 1.0 else 0.3048
@@ -429,8 +450,10 @@ class SvgTest {
 
     @Test fun `coordinates use a dot even under a comma locale`() {
         Locale.setDefault(Locale.GERMANY)
-        assertTrue(toSvg(dl()).contains("3.00 m"))
-        parse(toSvg(dl()))   // still well-formed (no comma-broken numbers)
+        val svg = toSvg(dl())
+        assertTrue(svg.contains("3.00 m"))
+        assertTrue(svg.contains("x1=\"20.0\""))   // a known wall coord: dot-decimal, not "20,0"
+        parse(svg)                                  // still well-formed (no comma-broken numbers)
     }
 
     @Test fun `a malicious label is escaped and cannot inject an element`() {
@@ -438,8 +461,10 @@ class SvgTest {
         assertTrue(doc.getElementsByTagName("script").length == 0)   // no injected element
     }
 
-    @Test fun `illegal XML control characters are stripped`() {
-        parse(toSvg(dl(label = "a bc")))   // NUL/backspace are illegal in XML 1.0 -> must be removed
+    @Test fun `illegal XML control chars, surrogates, and over-length are handled by sanitizeLabel`() {
+        parse(toSvg(dl(label = "a\u0000b\u0008c")))            // NUL/backspace illegal in XML 1.0 -> stripped
+        parse(toSvg(dl(label = "\uD800 lonely")))              // unpaired high surrogate -> stripped
+        parse(toSvg(dl(label = "x".repeat(5000))))             // over-long -> capped, still well-formed
     }
 
     @Test fun `an oversized display list is rejected`() {
@@ -492,7 +517,7 @@ fun toSvg(dl: DisplayList, pxPerMetre: Double = 100.0, maxCommands: Int = 10000)
     val t = RenderTransform(dl, pxPerMetre)
     val wallHex = RenderStyle.svgHex(RenderStyle.wallArgb); val markHex = RenderStyle.svgHex(RenderStyle.markerArgb)
     return buildString {
-        append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"${t.widthPx}\" height=\"${t.heightPx}\" viewBox=\"0 0 ${t.widthPx} ${t.heightPx}\">")
+        append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"${t.widthPx}\" height=\"${t.heightPx}\" viewBox=\"0 0 ${t.widthPx} ${t.heightPx}\" font-family=\"${RenderStyle.fontFamily}\">")
         for (c in dl.commands) when (c) {
             is DrawCmd.Wall -> append("<line x1=\"${f(t.x(c.a.x))}\" y1=\"${f(t.y(c.a.z))}\" x2=\"${f(t.x(c.b.x))}\" y2=\"${f(t.y(c.b.z))}\" stroke=\"$wallHex\" stroke-width=\"${RenderStyle.strokeWidthPx}\"/>")
             is DrawCmd.Dimension -> append("<text x=\"${f(t.x((c.a.x+c.b.x)/2))}\" y=\"${f(t.y((c.a.z+c.b.z)/2))}\" font-size=\"${RenderStyle.dimTextPx}\">${esc(c.text)}</text>")
@@ -585,6 +610,7 @@ import androidx.compose.ui.graphics.nativeCanvas
 import itr.core.render.DisplayList
 import itr.core.render.DrawCmd
 import itr.core.render.RenderStyle
+import itr.core.render.RenderTransform
 
 @Composable
 fun FloorplanCanvas(displayList: DisplayList, pxPerMetre: Float = 100f, modifier: Modifier = Modifier) {
@@ -592,18 +618,20 @@ fun FloorplanCanvas(displayList: DisplayList, pxPerMetre: Float = 100f, modifier
 }
 
 private fun DrawScope.draw(dl: DisplayList, s: Float) {
-    val pad = RenderStyle.paddingPx
+    val t = RenderTransform(dl, s.toDouble())            // shared mapping (parity with SVG/PNG)
     val wall = Color(RenderStyle.wallArgb); val mark = Color(RenderStyle.markerArgb)
-    fun sx(x: Double) = ((x - dl.boundsMin.x).toFloat()) * s + pad
-    fun sy(z: Double) = ((z - dl.boundsMin.z).toFloat()) * s + pad
-    fun text(t: String, x: Float, y: Float, px: Float) =
-        drawContext.canvas.nativeCanvas.drawText(t, x, y, android.graphics.Paint().apply { textSize = px })
+    fun x(v: Double) = t.x(v).toFloat(); fun y(v: Double) = t.y(v).toFloat()
+    fun text(str: String, px: Float, cx: Float, cy: Float, center: Boolean = false) =
+        drawContext.canvas.nativeCanvas.drawText(str, cx, cy, android.graphics.Paint().apply {
+            textSize = px; color = RenderStyle.wallArgb.toInt(); typeface = android.graphics.Typeface.SANS_SERIF
+            textAlign = if (center) android.graphics.Paint.Align.CENTER else android.graphics.Paint.Align.LEFT
+        })
     for (c in dl.commands) when (c) {
-        is DrawCmd.Wall -> drawLine(wall, Offset(sx(c.a.x), sy(c.a.z)), Offset(sx(c.b.x), sy(c.b.z)), strokeWidth = RenderStyle.strokeWidthPx)
-        is DrawCmd.Marker -> { drawCircle(mark, 4f, Offset(sx(c.at.x), sy(c.at.z))); text(c.label, sx(c.at.x)+6, sy(c.at.z), RenderStyle.markerLabelPx) }
-        is DrawCmd.Dimension -> text(c.text, sx((c.a.x+c.b.x)/2), sy((c.a.z+c.b.z)/2), RenderStyle.dimTextPx)
-        is DrawCmd.AreaLabel -> text(c.text, sx(c.at.x), sy(c.at.z), RenderStyle.areaTextPx)
-        is DrawCmd.ScaleBar -> { drawLine(wall, Offset(sx(c.origin.x), sy(c.origin.z)), Offset(sx(c.origin.x + c.lengthM), sy(c.origin.z)), strokeWidth = RenderStyle.strokeWidthPx); text(c.label, sx(c.origin.x), sy(c.origin.z)+14, RenderStyle.scaleTextPx) }
+        is DrawCmd.Wall -> drawLine(wall, Offset(x(c.a.x), y(c.a.z)), Offset(x(c.b.x), y(c.b.z)), strokeWidth = RenderStyle.strokeWidthPx)
+        is DrawCmd.Marker -> { drawCircle(mark, RenderStyle.markerRadiusPx, Offset(x(c.at.x), y(c.at.z))); text(c.label, RenderStyle.markerLabelPx, x(c.at.x)+RenderStyle.markerLabelDx, y(c.at.z)) }
+        is DrawCmd.Dimension -> text(c.text, RenderStyle.dimTextPx, x((c.a.x+c.b.x)/2), y((c.a.z+c.b.z)/2))
+        is DrawCmd.AreaLabel -> text(c.text, RenderStyle.areaTextPx, x(c.at.x), y(c.at.z), center = true)
+        is DrawCmd.ScaleBar -> { drawLine(wall, Offset(x(c.origin.x), y(c.origin.z)), Offset(x(c.origin.x + c.lengthM), y(c.origin.z)), strokeWidth = RenderStyle.strokeWidthPx); text(c.label, RenderStyle.scaleTextPx, x(c.origin.x), y(c.origin.z)+RenderStyle.scaleLabelDy) }
     }
 }
 ```
@@ -661,6 +689,7 @@ package itr.export.android
 
 import itr.core.geometry.Vec2
 import itr.core.geometry.buildFloorPlan
+import itr.core.render.RenderStyle
 import itr.core.render.Units
 import itr.core.render.buildDisplayList
 import org.junit.Assert.assertEquals
@@ -688,10 +717,17 @@ class PngTest {
         assertTrue(bmp.width >= 3 * 100 && bmp.height >= 4 * 100)
     }
 
-    @Test fun `an empty display list still produces a valid 1x1-or-padded png (documented degenerate case)`() {
+    @Test fun `native graphics actually rasterizes — a wall pixel is dark, a corner pixel is white`() {
+        val bmp = renderPng(dl, pxPerMetre = 100f)
+        // bottom wall (z=0) sits at y≈pad (20); sample a point along it, and a far background corner
+        val onWall = bmp.getPixel(160, RenderStyle.paddingPx.toInt())
+        assertTrue(android.graphics.Color.red(onWall) < 128)                 // drawn (dark), not white
+        assertEquals(android.graphics.Color.WHITE, bmp.getPixel(bmp.width - 2, bmp.height - 2))
+    }
+
+    @Test fun `an empty display list still produces a valid padded png (documented degenerate case)`() {
         val empty = buildDisplayList(buildFloorPlan(listOf(Vec2(0.0,0.0), Vec2(1.0,0.0)), emptyList(), snapped = false), Units.METRIC)
-        val bytes = renderPngBytes(empty, 100f)   // must not throw
-        assertTrue(bytes.isNotEmpty())
+        assertTrue(renderPngBytes(empty, 100f).isNotEmpty())   // must not throw
     }
 }
 ```
@@ -708,34 +744,34 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Typeface
 import itr.core.render.DisplayList
 import itr.core.render.DrawCmd
 import itr.core.render.RenderStyle
+import itr.core.render.RenderTransform
 import java.io.ByteArrayOutputStream
-import kotlin.math.ceil
 
 private const val MAX_PIXELS = 40_000_000   // ~40 MP guard against OOM
 
 fun renderPng(dl: DisplayList, pxPerMetre: Float = 100f): Bitmap {
-    require(pxPerMetre.isFinite() && pxPerMetre > 0) { "pxPerMetre must be finite and > 0" }
-    require(dl.boundsMax.x >= dl.boundsMin.x && dl.boundsMax.z >= dl.boundsMin.z) { "reversed bounds" }
-    val pad = RenderStyle.paddingPx
-    val w = ceil((dl.boundsMax.x - dl.boundsMin.x).toFloat() * pxPerMetre + 2 * pad).toInt().coerceAtLeast(1)
-    val h = ceil((dl.boundsMax.z - dl.boundsMin.z).toFloat() * pxPerMetre + 2 * pad).toInt().coerceAtLeast(1)
-    require(w.toLong() * h <= MAX_PIXELS) { "image too large: ${w.toLong()*h} px" }
-    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val t = RenderTransform(dl, pxPerMetre.toDouble())   // shared mapping + validation (parity with SVG/Compose)
+    require(t.widthPx.toLong() * t.heightPx <= MAX_PIXELS) { "image too large: ${t.widthPx.toLong()*t.heightPx} px" }
+    val bmp = Bitmap.createBitmap(t.widthPx, t.heightPx, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bmp); canvas.drawColor(Color.WHITE)
-    fun sx(x: Double) = ((x - dl.boundsMin.x).toFloat()) * pxPerMetre + pad
-    fun sy(z: Double) = ((z - dl.boundsMin.z).toFloat()) * pxPerMetre + pad
+    fun x(v: Double) = t.x(v).toFloat(); fun y(v: Double) = t.y(v).toFloat()
     val wall = Paint().apply { color = RenderStyle.wallArgb.toInt(); strokeWidth = RenderStyle.strokeWidthPx }
     val mark = Paint().apply { color = RenderStyle.markerArgb.toInt() }
-    fun text(t: String, x: Float, y: Float, px: Float) = canvas.drawText(t, x, y, Paint().apply { color = Color.BLACK; textSize = px })
+    // single bundled font family shared with SVG (font-family="sans-serif") for consistent glyphs
+    fun paint(px: Float, center: Boolean = false) = Paint().apply {
+        color = Color.BLACK; textSize = px; typeface = Typeface.SANS_SERIF
+        textAlign = if (center) Paint.Align.CENTER else Paint.Align.LEFT
+    }
     for (c in dl.commands) when (c) {
-        is DrawCmd.Wall -> canvas.drawLine(sx(c.a.x), sy(c.a.z), sx(c.b.x), sy(c.b.z), wall)
-        is DrawCmd.Marker -> { canvas.drawCircle(sx(c.at.x), sy(c.at.z), 4f, mark); text(c.label, sx(c.at.x)+6, sy(c.at.z), RenderStyle.markerLabelPx) }
-        is DrawCmd.Dimension -> text(c.text, sx((c.a.x+c.b.x)/2), sy((c.a.z+c.b.z)/2), RenderStyle.dimTextPx)
-        is DrawCmd.AreaLabel -> text(c.text, sx(c.at.x), sy(c.at.z), RenderStyle.areaTextPx)
-        is DrawCmd.ScaleBar -> { canvas.drawLine(sx(c.origin.x), sy(c.origin.z), sx(c.origin.x + c.lengthM.toFloat()), sy(c.origin.z), wall); text(c.label, sx(c.origin.x), sy(c.origin.z)+14, RenderStyle.scaleTextPx) }
+        is DrawCmd.Wall -> canvas.drawLine(x(c.a.x), y(c.a.z), x(c.b.x), y(c.b.z), wall)
+        is DrawCmd.Marker -> { canvas.drawCircle(x(c.at.x), y(c.at.z), RenderStyle.markerRadiusPx, mark); canvas.drawText(c.label, x(c.at.x)+RenderStyle.markerLabelDx, y(c.at.z), paint(RenderStyle.markerLabelPx)) }
+        is DrawCmd.Dimension -> canvas.drawText(c.text, x((c.a.x+c.b.x)/2), y((c.a.z+c.b.z)/2), paint(RenderStyle.dimTextPx))
+        is DrawCmd.AreaLabel -> canvas.drawText(c.text, x(c.at.x), y(c.at.z), paint(RenderStyle.areaTextPx, center = true))  // CENTER matches SVG text-anchor="middle"
+        is DrawCmd.ScaleBar -> { canvas.drawLine(x(c.origin.x), y(c.origin.z), x(c.origin.x + c.lengthM), y(c.origin.z), wall); canvas.drawText(c.label, x(c.origin.x), y(c.origin.z)+RenderStyle.scaleLabelDy, paint(RenderStyle.scaleTextPx)) }
     }
     return bmp
 }
@@ -760,19 +796,22 @@ import android.content.Intent
 import androidx.core.content.FileProvider
 import java.io.File
 
-private val ALLOWED_EXT = setOf("png", "svg")
+// MIME is DERIVED from the (validated) extension so a .svg can't be shared as image/png
+private val MIME_BY_EXT = mapOf("png" to "image/png", "svg" to "image/svg+xml")
+private const val KEEP_MS = 24 * 60 * 60 * 1000L
 
 /**
  * Write [bytes] under cache/exports and return a read-only share Intent with a FileProvider URI.
- * [fileName] must be a bare basename with an allowed extension (no path traversal). Files older than
- * [keepMs] (vs the current clock) are swept. The URI is attached as ClipData so the chooser propagates
- * the read grant. Caller starts the chooser.
+ * [fileName] must be a bare basename with an allowed extension (no path traversal). MIME is derived
+ * from the extension. Files older than 24 h (vs [nowMs]) are swept. The URI is attached as ClipData
+ * so the chooser propagates the read grant. Caller starts the chooser.
  */
-fun shareExport(context: Context, fileName: String, mime: String, bytes: ByteArray, nowMs: Long = System.currentTimeMillis()): Intent {
+fun shareExport(context: Context, fileName: String, bytes: ByteArray, nowMs: Long = System.currentTimeMillis()): Intent {
     require(!fileName.contains('/') && !fileName.contains('\\') && fileName == File(fileName).name) { "fileName must be a bare basename" }
-    require(fileName.substringAfterLast('.', "").lowercase() in ALLOWED_EXT) { "extension not allowed" }
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    val mime = MIME_BY_EXT[ext] ?: throw IllegalArgumentException("extension not allowed: $ext")
     val dir = File(context.cacheDir, "exports").apply { require(mkdirs() || isDirectory) { "cannot create exports dir" } }
-    dir.listFiles()?.filter { it.isFile }?.forEach { if (nowMs - it.lastModified() > keepMs(dir)) it.delete() }
+    dir.listFiles()?.filter { it.isFile }?.forEach { if (nowMs - it.lastModified() > KEEP_MS) it.delete() }
     val target = File(dir, fileName)
     require(target.canonicalFile.parentFile == dir.canonicalFile) { "resolved path escapes the exports dir" }
     target.writeBytes(bytes)
@@ -784,7 +823,6 @@ fun shareExport(context: Context, fileName: String, mime: String, bytes: ByteArr
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
 }
-private fun keepMs(@Suppress("UNUSED_PARAMETER") dir: File) = 24 * 60 * 60 * 1000L
 ```
 
 `file_paths.xml`: `<paths><cache-path name="exports" path="exports/" /></paths>`
@@ -809,23 +847,25 @@ import kotlin.test.assertFailsWith
 class SharingTest {
     private val ctx get() = ApplicationProvider.getApplicationContext<android.content.Context>()
 
-    @Test fun `share intent is read-only with a resolvable uri and clipdata`() {
-        val intent = shareExport(ctx, "plan.png", "image/png", byteArrayOf(1,2,3))
-        assertEquals(Intent.ACTION_SEND, intent.action)
-        assertTrue(intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
-        assertEquals(0, intent.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)   // never writable
-        assertNotNull(intent.clipData)
+    @Test fun `share intent is read-only, derives MIME from the extension, has clipdata`() {
+        val png = shareExport(ctx, "plan.png", byteArrayOf(1,2,3))
+        assertEquals(Intent.ACTION_SEND, png.action)
+        assertEquals("image/png", png.type)                                   // derived, not passed
+        assertEquals("image/svg+xml", shareExport(ctx, "plan.svg", byteArrayOf(1)).type)
+        assertTrue(png.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
+        assertEquals(0, png.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)  // never writable
+        assertNotNull(png.clipData)
     }
 
     @Test fun `path traversal and disallowed extensions are rejected`() {
-        assertFailsWith<IllegalArgumentException> { shareExport(ctx, "../evil.png", "image/png", byteArrayOf(1)) }
-        assertFailsWith<IllegalArgumentException> { shareExport(ctx, "plan.exe", "x", byteArrayOf(1)) }
+        assertFailsWith<IllegalArgumentException> { shareExport(ctx, "../evil.png", byteArrayOf(1)) }
+        assertFailsWith<IllegalArgumentException> { shareExport(ctx, "plan.exe", byteArrayOf(1)) }
     }
 
     @Test fun `old exports are swept using the current clock`() {
         val dir = java.io.File(ctx.cacheDir, "exports").apply { mkdirs() }
         val stale = java.io.File(dir, "old.png").apply { writeBytes(byteArrayOf(0)); setLastModified(0L) }
-        shareExport(ctx, "new.png", "image/png", byteArrayOf(1), nowMs = 48L * 60 * 60 * 1000)  // 48h later
+        shareExport(ctx, "new.png", byteArrayOf(1), nowMs = 48L * 60 * 60 * 1000)   // 48h later
         assertFalse(stale.exists())
     }
 }
