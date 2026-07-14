@@ -4,7 +4,7 @@
 
 **Goal:** Make corner tapping work in rooms with more than 4 corners / non-rectangular (L-shaped) floors by casting the tap as a world-space ray against the **frozen infinite floor plane**, instead of requiring the tap to land inside an ARCore-detected plane polygon of the same subsumption root.
 
-**Architecture:** The floor's mathematical reference plane is already frozen at floor-confirmation (`FloorSelection.referencePlane`). A tap is an on-screen `DisplayPoint`; unproject it to a world-space ray (via `android.opengl.Matrix` on ARCore's view/projection matrices), intersect that ray with the infinite reference plane, accept the intersection if it is in front of the camera and within a distance cap. This removes the ARCore-plane-fragmentation coupling that breaks multi-wing rooms. The projection math (ray/plane intersection) is pure and JVM-tested; the unproject is device glue (compile + device checklist).
+**Architecture:** The floor's mathematical reference plane is already frozen at floor-confirmation (`FloorSelection.referencePlane`). A tap is an on-screen `DisplayPoint`; unproject it to a world-space ray whose origin is the camera position (via `android.opengl.Matrix` on ARCore's view/projection matrices), intersect that ray with the infinite reference plane, accept the intersection if it is in front of the camera, within a distance cap **measured from the camera**, and steep enough (incidence gate) to be a floor tap rather than a grazing wall tap. This removes the ARCore-plane-fragmentation coupling that breaks multi-wing rooms. It does NOT model occlusion (a v2 depth feature): a low wall-base tap can still project past the wall — mitigated, not prevented, by the incidence + distance caps and UX guidance. The projection math (ray/plane intersection, incidence, distance) is pure and JVM-tested; the unproject is device glue (compile + device checklist).
 
 **Tech Stack:** Kotlin 2.0.21, ARCore 1.43.0 (`Camera.getViewMatrix`/`getProjectionMatrix`), `android.opengl.Matrix` (platform, no new dep). Modules touched: `:core` (geometry + AR boundary), `:core-arcore` (adapter), `:feature-scan` (controller).
 
@@ -60,10 +60,24 @@ class RayTest {
         assertNull(floor.intersectRay(ray, maxDistance = 8.0))
     }
 
-    @Test fun `a hit beyond the distance cap is rejected`() {
-        val ray = Ray(Vec3(0.0, 10.0, 0.0), Vec3(0.0, -1.0, 0.0))  // would hit at t=10
+    @Test fun `a hit beyond the distance cap (from the ray origin) is rejected`() {
+        val ray = Ray(Vec3(0.0, 10.0, 0.0), Vec3(0.0, -1.0, 0.0))  // would hit at 10 m from origin
         assertNull(floor.intersectRay(ray, maxDistance = 8.0))
         assertNotNull(floor.intersectRay(ray, maxDistance = 12.0))
+    }
+
+    @Test fun `a grazing ray below the minimum incidence is rejected`() {
+        // dir mostly horizontal: 0.2 down, 1.0 forward -> incidence (|dir·n| after normalize) ~= 0.196.
+        val grazing = Ray(Vec3(0.0, 2.0, 0.0), Vec3(0.0, -0.2, -1.0))
+        assertNull(floor.intersectRay(grazing, maxDistance = 20.0, minIncidence = 0.26))  // ~15deg floor
+        // a steep straight-down tap easily clears the same threshold.
+        assertNotNull(floor.intersectRay(Ray(Vec3(0.0, 2.0, 0.0), Vec3(0.0, -1.0, 0.0)),
+            maxDistance = 8.0, minIncidence = 0.26))
+    }
+
+    @Test fun `minIncidence default 0 accepts any non-parallel forward hit`() {
+        val shallow = Ray(Vec3(0.0, 2.0, 0.0), Vec3(0.0, -0.2, -1.0))
+        assertNotNull(floor.intersectRay(shallow, maxDistance = 20.0))   // default minIncidence = 0.0
     }
 
     @Test fun `a non-finite ray returns null, never throws`() {
@@ -92,21 +106,30 @@ data class Ray(val origin: Vec3, val direction: Vec3)
 
 /**
  * Intersect [ray] with this infinite plane. Returns the world point iff the ray crosses the plane
- * strictly in FRONT of the origin (t > 0) and within [maxDistance] metres of the origin; else null.
- * Total: parallel rays, back-facing rays, non-finite inputs, and out-of-range hits all return null
- * (never throws). t==0 (origin already on the plane) is treated as no forward hit.
+ * strictly in FRONT of the origin (t > 0), within [maxDistance] metres of the ray origin, and at an
+ * incidence of at least [minIncidence] = |unit(direction)·unit(normal)| (0 = accept any angle, 1 =
+ * only perpendicular). The incidence gate rejects near-grazing rays (aiming low along the floor)
+ * whose far intersection is unreliable. Total: parallel/back-facing/non-finite/out-of-range/too-
+ * grazing all return null (never throws). t==0 (origin already on the plane) is no forward hit.
+ *
+ * NOTE: this is an INFINITE-plane cast — it does NOT model occlusion. A ray aimed low at a wall base
+ * can cross the wall and still intersect the floor beyond it. The minIncidence + distance caps make
+ * that unlikely for a steeply-aimed floor tap but do not guarantee it; real occlusion is a v2 depth
+ * feature. Callers must guide the user to aim at the floor corner (see the device checklist).
  */
-fun Plane.intersectRay(ray: Ray, maxDistance: Double): Vec3? {
+fun Plane.intersectRay(ray: Ray, maxDistance: Double, minIncidence: Double = 0.0): Vec3? {
     val nlen = normal.length()
     if (!nlen.isFinite() || nlen < 1e-12) return null             // guard: Vec3.normalized() THROWS on zero
     val n = normal * (1.0 / nlen)
-    val d = ray.direction
+    val dlen = ray.direction.length()
+    if (!dlen.isFinite() || dlen < 1e-12) return null
+    val d = ray.direction * (1.0 / dlen)                          // unit direction -> t is metres, denom is incidence
     val denom = d.dot(n)
     if (!denom.isFinite() || denom == 0.0) return null            // parallel (or degenerate)
+    if (kotlin.math.abs(denom) < minIncidence) return null        // too grazing
     val t = (point - ray.origin).dot(n) / denom
     if (!t.isFinite() || t <= 0.0) return null                    // behind or on the origin
-    val distance = t * d.length()
-    if (!distance.isFinite() || distance > maxDistance) return null
+    if (t > maxDistance) return null                              // t is already metres (unit direction)
     val hit = ray.origin + d * t
     if (!hit.x.isFinite() || !hit.y.isFinite() || !hit.z.isFinite()) return null
     return hit
@@ -165,15 +188,18 @@ Import `itr.core.geometry.Ray` in `ArBoundary.kt`.
             if (out[3] == 0f) return null
             return Vec3((out[0] / out[3]).toDouble(), (out[1] / out[3]).toDouble(), (out[2] / out[3]).toDouble())
         }
-        val near = unproject(-1f) ?: return null    // near-plane point ~ camera position
-        val far = unproject(1f) ?: return null       // far-plane point
-        val dir = far - near
-        if (dir.length() == 0.0) return null
-        return Ray(near, dir.normalized())
+        val far = unproject(1f) ?: return null       // far-plane point along the tap ray
+        // Ray origin = the actual camera position (NOT the near-plane point), so intersectRay's
+        // distance cap is measured from the camera, not from Z_NEAR ahead of it.
+        val cp = camera.pose
+        val origin = Vec3(cp.tx().toDouble(), cp.ty().toDouble(), cp.tz().toDouble())
+        val dir = far - origin
+        if (dir.length() < 1e-9) return null
+        return Ray(origin, dir)      // intersectRay normalizes; direction need not be unit here
     }
 ```
 
-Add companion constants: `private const val Z_NEAR = 0.1f; private const val Z_FAR = 100f`. Import `itr.core.geometry.Ray`, `com.google.ar.core.TrackingState` (if not already imported). Both `getProjectionMatrix` calls / the single call must use the SAME near/far as any other projection use — this method owns its own consistent pair, so it's self-consistent.
+Add companion constants: `private const val Z_NEAR = 0.1f; private const val Z_FAR = 100f`. Import `itr.core.geometry.Ray`, `com.google.ar.core.TrackingState` (if not already imported). The single `getProjectionMatrix` call owns its own consistent near/far pair, so the unproject is self-consistent.
 
 - [ ] **Step 3: Compile** — `./gradlew :core-arcore:compileDebugKotlin` → SUCCESS.
 
@@ -181,63 +207,51 @@ Add companion constants: `private const val Z_NEAR = 0.1f; private const val Z_F
 
 ---
 
-### Task 3: Corner tap uses the floor ray-cast (feature-scan)
+### Task 3: Corner tap uses the floor ray-cast (feature-scan glue + FloorSelection cleanup)
+
+**Testing note:** `ScanController` takes the concrete final `ArCoreSession` (not `ArFrameRef`), and there is **no `feature-scan/src/test` tree** — `ScanController` is untested glue in this codebase (all testable Plan-4 logic lives in pure `:core`). This plan keeps that split: the new correctness surface (`intersectRay` incidence/distance/front gating) is fully covered by Task 1's pure `RayTest`; the controller change is compile-verified + device-checklist-verified. Do NOT invent a feature-scan test harness.
 
 **Files:**
-- Modify: `feature-scan/src/main/kotlin/itr/scan/ScanController.kt` (`projectedEligibleHit`, distance constant; remove dead `isHitEligible` use)
-- Modify: `core/src/main/kotlin/itr/core/ar/FloorSelection.kt` (remove now-unused `isHitEligible` — corners were its only caller; keep `referencePlane` + `confirm`)
-- Test: `feature-scan/src/test/kotlin/itr/scan/ScanControllerTest.kt` (or wherever corner-tap tests live) — update the fake `ArFrameRef` to return a `Ray`, add an L-shaped 6-corner tap test.
+- Modify: `feature-scan/src/main/kotlin/itr/scan/ScanController.kt` (`projectedEligibleHit`, add `MAX_CORNER_DISTANCE_M`/`MIN_CORNER_INCIDENCE`, remove `FROZEN_PLANE_DRIFT_TOLERANCE_M` + its check + unused `abs` import if now unused)
+- Modify: `core/src/main/kotlin/itr/core/ar/FloorSelection.kt` (remove `isHitEligible` + the now-dead `confirmed` field + its subsumption doc; keep `referencePlane`, `confirm`, `resolveRoot`)
+- Modify: `core/src/test/kotlin/itr/core/ar/FloorSelectionTest.kt` (delete the 4 `isHitEligible` assertions + fixtures used only by them; keep `confirm` validation tests)
 
-- [ ] **Step 1: Callers confirmed (2026-07-14)** — `isHitEligible` is referenced only by: `FloorSelection.kt:56` (definition), `ScanController.kt:318` (the corner call we replace), and `FloorSelectionTest.kt:55,56,57,63` (4 assertions). No other production caller. So removal is safe; the 4 `FloorSelectionTest` assertions (and any `bigger`/`hitOnBigger`/`other` fixtures used only by them) are deleted in Step 5. Keep the `FloorSelection.confirm` validation tests in that file (they don't use `isHitEligible`).
+- [ ] **Step 1: Callers confirmed (2026-07-14)** — `isHitEligible` is referenced only by: `FloorSelection.kt:56` (definition), `ScanController.kt:318` (the corner call we replace), and `FloorSelectionTest.kt:55,56,57,63` (4 assertions). No other production caller. After removal, `FloorSelection.confirmed` is read by nothing → remove that field too (Step 3). `FROZEN_PLANE_DRIFT_TOLERANCE_M` (ScanController companion ~384) is referenced only by the drift check being deleted.
 
-- [ ] **Step 2: Write the failing 6-corner tap test** — update the corner-tap fake frame to implement `cameraRay` (returning a caller-supplied ray) and drop/adjust its `hitTest`. Then a test that taps 6 corners of an L-shape and asserts all 6 land on the floor plane and assemble a valid 6-gon.
-
-```kotlin
-    // In the test's fake ArFrameRef: return a straight-down ray through a supplied world XZ,
-    // 2 m above the floor, so intersectRay lands exactly on (x, 0, z).
-    private fun downRayThrough(x: Double, z: Double) =
-        Ray(Vec3(x, 2.0, z), Vec3(0.0, -1.0, 0.0))
-    // fake: override fun cameraRay(point: DisplayPoint) = nextRay   // set per tap by the test
-
-    @Test fun `six corners of an L-shaped room all capture and assemble a valid polygon`() {
-        val c = controllerOnConfirmedFloor()   // existing helper: floor confirmed, stage == CORNERS
-        // L-shape (metres), captured in order:
-        val corners = listOf(0.0 to 0.0, 4.0 to 0.0, 4.0 to 2.0, 2.0 to 2.0, 2.0 to 4.0, 0.0 to 4.0)
-        corners.forEach { (x, z) ->
-            fakeFrame.nextRay = downRayThrough(x, z)
-            assertTrue(c.tapCorner(DisplayPoint(10.0, 10.0, 1080, 2400)))
-        }
-        c.advance()                              // CORNERS -> next stage
-        val room = c.previewRoom()
-        assertNotNull(room)
-        assertEquals(6, room!!.floorPlan.rawCorners.size)
-        assertTrue(room.floorPlan.isValid)
-    }
-```
-
-> Use the test file's existing controller/fake-frame construction helpers and `DisplayPoint` view dims — the snippet shows intent; wire it to the actual fixtures. If the existing fake `ArFrameRef` is shared, give it a settable `nextRay` and a `cameraRay` override.
-
-- [ ] **Step 3: Run red** — the fake has no `cameraRay` yet / `projectedEligibleHit` still calls `hitTest` → FAIL / won't compile.
-
-- [ ] **Step 4: Replace `projectedEligibleHit`** — ray-cast the frozen floor plane, front + distance-capped; drop the `hitTest`/`isHitEligible`/drift path (the intersection is exactly on the reference plane by construction, so the drift check is redundant):
+- [ ] **Step 2: Replace `projectedEligibleHit`** — ray-cast the frozen floor plane; front + distance-capped + incidence-gated. Drop the `hitTest`/`isHitEligible`/drift path (the intersection lies exactly on the reference plane by construction, so the old drift check is redundant):
 
 ```kotlin
     private fun projectedEligibleHit(point: DisplayPoint): Vec3? {
         val floor = floorSelection ?: return failUiNull("Confirm the floor first")
         val frame = session.latestFrame() ?: return failUiNull("No current AR frame")
         val ray = frame.cameraRay(point) ?: return failUiNull("Move so the floor is in view, then tap")
-        return floor.referencePlane.intersectRay(ray, MAX_CORNER_DISTANCE_M)
-            ?: return failUiNull("Aim at the floor within $MAX_CORNER_DISTANCE_M m and tap")
+        return floor.referencePlane.intersectRay(ray, MAX_CORNER_DISTANCE_M, MIN_CORNER_INCIDENCE)
+            ?: return failUiNull("Aim down at the floor corner (within $MAX_CORNER_DISTANCE_M m)")
     }
 ```
 
-Add to the companion: `private const val MAX_CORNER_DISTANCE_M = 8.0`. Import `itr.core.geometry.Ray` and `itr.core.geometry.intersectRay`. **Remove `FROZEN_PLANE_DRIFT_TOLERANCE_M`** (companion line ~384) — verified 2026-07-14 that the drift check (the two lines being deleted) is its ONLY reference; object placement does not use it. Also drop the now-unused `abs` import if nothing else in the file uses `kotlin.math.abs` (grep before removing — `MarkerTracker`/other methods may).
+Add to the companion: `private const val MAX_CORNER_DISTANCE_M = 8.0` and `private const val MIN_CORNER_INCIDENCE = 0.26` (~15° above the floor — rejects near-grazing wall-base taps). Import `itr.core.geometry.intersectRay` (do NOT import `Ray` — the name isn't referenced; `frame.cameraRay(...)` returns it and it flows straight into `intersectRay`). **Remove** `FROZEN_PLANE_DRIFT_TOLERANCE_M` and its two-line check. After removal, grep `kotlin.math.abs` / `abs(` in the file; drop the `import kotlin.math.abs` ONLY if no other use remains.
 
-- [ ] **Step 5: Remove `isHitEligible` from `FloorSelection`** — delete the method and its doc; keep `referencePlane`, `confirm`, `resolveRoot` (still used at confirmation). Delete any `isHitEligible`-specific test.
+- [ ] **Step 3: Simplify `FloorSelection`** — delete `isHitEligible` and its doc; delete the `confirmed` constructor param + field + the "live subsumption chain" paragraph (now dead). Keep the frozen `referencePlane`, the `confirm(root, referencePlane)` factory (which still calls `resolveRoot(root)` to reject cycles and validate the root is a tracking upward-horizontal plane), and the top-level `resolveRoot`. Result:
 
-- [ ] **Step 6: Run to green** — `./gradlew :core:test :feature-scan:compileDebugKotlin` and the feature-scan JVM tests for the controller. All PASS. Existing corner tests that fed `hitTest` must now feed `cameraRay` — update them (they should assert the same landed corners via the down-ray helper).
+```kotlin
+class FloorSelection private constructor(val referencePlane: Plane) {
+    companion object {
+        fun confirm(root: ArPlaneRef, referencePlane: Plane): FloorSelection {
+            val r = resolveRoot(root)   // throws on a cycle
+            require(r.type == PlaneType.HORIZONTAL_UP) { "floor must be an upward-horizontal plane, got ${r.type}" }
+            require(r.isTracking) { "floor plane must be tracking at confirmation" }
+            return FloorSelection(referencePlane)
+        }
+    }
+}
+```
 
-- [ ] **Step 7: Commit** — `feat(scan): capture corners by ray-casting the frozen floor plane (N-gon / L-shape rooms)`.
+- [ ] **Step 4: Delete the `isHitEligible` tests** — in `FloorSelectionTest.kt` remove the 4 assertions at lines 55–57 and 63 and any `bigger`/`hitOnBigger`/`other` fixtures they alone use. Keep tests that exercise `confirm` validation (cycle/type/tracking) and `referencePlane`.
+
+- [ ] **Step 5: Run to green** — `./gradlew :core:test :core-arcore:compileDebugKotlin :feature-scan:compileDebugKotlin`. Core tests (incl. RayTest + the trimmed FloorSelectionTest) PASS; both AR modules compile.
+
+- [ ] **Step 6: Commit** — `feat(scan): capture corners by ray-casting the frozen floor plane (N-gon / L-shape rooms)`.
 
 ---
 
@@ -249,8 +263,9 @@ Add to the companion: `private const val MAX_CORNER_DISTANCE_M = 8.0`. Import `i
 - [ ] **Step 1** — add DATED checklist items:
   - [ ] In a plain rectangular room, tap 4 corners → plan matches (regression: the fix didn't break the common case).
   - [ ] In an **L-shaped / 6-corner** room, walk both wings, confirm the floor once, tap all 6 corners (including corners in the wing away from the confirmed ARCore plane) → all 6 capture, no "Tap must hit the confirmed floor".
-  - [ ] Tap a corner at a far wall (> 8 m) → rejected with the distance message (cap works).
-  - [ ] Aim at a wall / ceiling (no floor in the ray path) → rejected cleanly, no crash.
+  - [ ] Tap aimed far down the floor (> 8 m from the camera) → rejected with the distance message (cap works).
+  - [ ] Tap aimed nearly horizontally / up at a wall or ceiling → rejected by the incidence gate, no crash, no corner added.
+  - [ ] **Known limitation (verify the UX guidance, not a rejection):** aiming LOW at a wall base can still project a corner onto the floor *beyond* the wall (infinite-plane cast, no occlusion in v1). Confirm the on-screen guidance tells the user to aim down at the actual floor corner, and that a bad corner is fixable via edit. (Real occlusion = v2 depth API.)
   - [ ] Completed L-shaped scan saves, shows on Home, Detail renders the non-rectangular plan, PNG/SVG export shows the L outline.
 
 - [ ] **Step 2: Commit** — `docs: Plan 7 N-gon corner-capture device checklist`.
@@ -258,9 +273,9 @@ Add to the companion: `private const val MAX_CORNER_DISTANCE_M = 8.0`. Import `i
 ---
 
 ## Done
-Corner capture no longer depends on ARCore floor-plane fragmentation. Any polygon the user can tap (≥3 corners, front of camera, within 8 m) captures against the frozen infinite floor plane. Remaining verification is the DATED device checklist on the Xiaomi (rectangular regression + L-shape).
+Corner capture no longer depends on ARCore floor-plane fragmentation. Any polygon the user can tap (≥3 corners, aimed down at the floor, within 8 m of the camera, steep enough to pass the incidence gate) captures against the frozen infinite floor plane. Occlusion is explicitly out of v1 (documented limitation). Remaining verification is the DATED device checklist on the Xiaomi (rectangular regression + L-shape).
 
 ## Self-review notes
-- Spec coverage: ray type + intersection (Task 1), unproject primitive (Task 2), corner path swap + dead-code removal (Task 3), device checklist (Task 4). Matches the on-device finding + user's "fix now, frustum + distance cap" decision.
-- Purity/testing: `Ray`/`intersectRay` and the 6-corner controller flow are JVM-tested; the matrix unproject is device glue (compile + checklist). Distance cap and front-only gating are unit-tested.
-- Type consistency: `Ray(origin, direction)`, `Plane.intersectRay(ray, maxDistance): Vec3?`, `ArFrameRef.cameraRay(point): Ray?`, `MAX_CORNER_DISTANCE_M = 8.0`, `Z_NEAR/Z_FAR`. Consumes `FloorSelection.referencePlane` (Plan 3), `Plane`/`Vec3` (Plan 1), `DisplayPoint` (Plan 3). Removes `FloorSelection.isHitEligible` (corners were its only caller).
+- Spec coverage: ray type + gated intersection (Task 1), camera-origin unproject primitive (Task 2), corner-path swap + dead-code removal (Task 3), device checklist incl. the documented occlusion limitation (Task 4). Matches the on-device finding + user's "fix now, frustum + distance cap" decision; the incidence gate is the concrete "frustum" refinement.
+- Purity/testing: `Ray`/`intersectRay` (front + distance-from-origin + incidence + totality) is JVM-tested in `RayTest`. `ScanController` stays untested glue (consistent with the existing codebase — no `feature-scan/src/test`); the matrix unproject is device glue (compile + checklist).
+- Type consistency: `Ray(origin, direction)`, `Plane.intersectRay(ray, maxDistance, minIncidence = 0.0): Vec3?`, `ArFrameRef.cameraRay(point): Ray?`, `MAX_CORNER_DISTANCE_M = 8.0`, `MIN_CORNER_INCIDENCE = 0.26`, `Z_NEAR/Z_FAR`. Consumes `FloorSelection.referencePlane` (Plan 3), `Plane`/`Vec3` (Plan 1, `Vectors.kt`), `DisplayPoint`/`ArFrameRef` (Plan 3). Removes `FloorSelection.isHitEligible` + `confirmed` field, `ScanController.FROZEN_PLANE_DRIFT_TOLERANCE_M`.
