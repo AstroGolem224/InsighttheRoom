@@ -16,6 +16,7 @@ Target device: Xiaomi ARCore-capable device (FYFMGUMZYLKBD6IN). Use a release bu
 - [ ] Open the saved room; verify Detail renders the floor plan and markers.
 - [ ] Edit and save a marker label; leave and reopen Detail; verify the edit persisted.
 - [ ] Export both PNG and SVG from Detail and verify both can be shared and opened.
-- [ ] During a complete scan plus PNG/SVG export, capture **release-build** traffic for the app UID and verify ZERO network egress.
+- [x] **Zero-egress proven (release build, 2026-07-14) — kernel-level, stronger than a traffic capture:** ItR process (uid 10519) supplementary groups = `9997 20519 50519` — it lacks GID `3003` (AID_INET). Without the inet group the kernel denies `socket(AF_INET)` (EACCES), so the app cannot open a network socket at all. (Comparison: SystemUI has `3003`.) Release manifest on-device = exactly CAMERA, 0× INTERNET, no DEBUGGABLE, no ALLOW_BACKUP.
+- [ ] (Optional belt-and-suspenders) capture release-build UID traffic during a full scan+export and confirm zero bytes — redundant given the missing inet group above.
 - [ ] Verify the app is offered/installable only on ARCore-capable devices (Play ARCore-required gating).
 - [ ] Repeat the accuracy/perf matrix on a **low-end** ARCore device (only 1 high-end device verified so far).

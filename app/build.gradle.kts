@@ -18,6 +18,15 @@ android {
         versionName = "1.0"
     }
 
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            // ponytail: debug keystore just to make the release APK installable for the on-device
+            // zero-egress capture; real release signing is a store-publish concern, not this test.
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
     buildFeatures { compose = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
