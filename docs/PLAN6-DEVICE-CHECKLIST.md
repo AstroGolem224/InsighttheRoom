@@ -20,3 +20,12 @@ Target device: Xiaomi ARCore-capable device (FYFMGUMZYLKBD6IN). Use a release bu
 - [ ] (Optional belt-and-suspenders) capture release-build UID traffic during a full scan+export and confirm zero bytes — redundant given the missing inet group above.
 - [ ] Verify the app is offered/installable only on ARCore-capable devices (Play ARCore-required gating).
 - [ ] Repeat the accuracy/perf matrix on a **low-end** ARCore device (only 1 high-end device verified so far).
+
+## Plan 7 N-gon corner capture — 2026-07-14
+
+- [ ] In a plain rectangular room, tap 4 corners → plan matches (regression: the fix didn't break the common case).
+- [ ] In an **L-shaped / 6-corner** room, walk both wings, confirm the floor once, tap all 6 corners (including corners in the wing away from the confirmed ARCore plane) → all 6 capture, no "Tap must hit the confirmed floor".
+- [ ] Tap aimed far down the floor (> 8 m from the camera) → rejected with the distance message (cap works).
+- [ ] Tap aimed nearly horizontally / up at a wall or ceiling → rejected by the incidence gate, no crash, no corner added.
+- [ ] **Known limitation (verify the UX guidance, not a rejection):** aiming LOW at a wall base can still project a corner onto the floor *beyond* the wall (infinite-plane cast, no occlusion in v1). Confirm the on-screen guidance tells the user to aim down at the actual floor corner, and that a bad corner is fixable via edit. (Real occlusion = v2 depth API.)
+- [ ] Completed L-shaped scan saves, shows on Home, Detail renders the non-rectangular plan, PNG/SVG export shows the L outline.

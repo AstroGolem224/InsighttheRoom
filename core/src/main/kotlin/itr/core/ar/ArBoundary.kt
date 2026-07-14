@@ -1,5 +1,6 @@
 package itr.core.ar
 
+import itr.core.geometry.Ray
 import itr.core.geometry.Vec3
 
 /** A point in the display's pixel space (for synchronous user taps — corner tapping). */
@@ -59,6 +60,14 @@ interface ArFrameRef {
      * projectDetectorPointToFloor, so a late result never hits the wrong (current) frame.
      */
     fun hitTest(point: DisplayPoint): Pair<ArPlaneRef, Vec3>?
+
+    /**
+     * Unproject an on-screen [point] to a world-space ray (origin near the camera, direction into
+     * the scene). Null if display geometry isn't set yet or the view/projection matrix is singular.
+     * This is the plane-agnostic corner-capture primitive: intersect the returned ray with the
+     * frozen floor plane instead of requiring an ARCore plane hit.
+     */
+    fun cameraRay(point: DisplayPoint): Ray?
 }
 
 /** The AR session surface the app drives; Plan 3b wraps ARCore + SceneView. */

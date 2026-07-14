@@ -40,36 +40,13 @@ fun selectFloorCandidate(planes: List<ArPlaneRef>, minAreaM2: Double = 2.0): ArP
         .minByOrNull { it.centerY }
 }
 
-/**
- * A confirmed floor. Hit eligibility follows the LIVE subsumption chain of BOTH the hit and the
- * confirmed plane, so a confirmed root later merged into a bigger plane still matches. The metric
- * reference plane is required and FROZEN at confirmation — a new confirm() is the only way to change
- * it (explicit user recalibration), never a silent ARCore update.
- */
-class FloorSelection private constructor(
-    private val confirmed: ArPlaneRef,
-    val referencePlane: Plane,
-) {
-    /** Eligible iff the hit resolves to the same live root as the confirmed plane AND both resolved
-     *  roots are tracking upward-horizontal planes (in-polygon containment / tolerance is guaranteed
-     *  by the adapter's hitTest(DisplayPoint), which only returns hits on a real plane). */
-    fun isHitEligible(hitPlane: ArPlaneRef): Boolean {
-        val hitRoot = resolveRoot(hitPlane)
-        val confRoot = resolveRoot(confirmed)
-        if (hitRoot.id != confRoot.id) return false
-        // both resolved roots must be a tracking upward-horizontal plane (a merged root can lose tracking).
-        // In-polygon containment for a synchronous tap is guaranteed by the adapter's hitTest(DisplayPoint),
-        // which only returns a hit on a real plane; async detections use captured-room containment instead.
-        return hitRoot.isTracking && hitRoot.type == PlaneType.HORIZONTAL_UP &&
-               confRoot.isTracking && confRoot.type == PlaneType.HORIZONTAL_UP
-    }
-
+class FloorSelection private constructor(val referencePlane: Plane) {
     companion object {
         fun confirm(root: ArPlaneRef, referencePlane: Plane): FloorSelection {
-            val r = resolveRoot(root)   // also throws on a cycle
+            val r = resolveRoot(root)   // throws on a cycle
             require(r.type == PlaneType.HORIZONTAL_UP) { "floor must be an upward-horizontal plane, got ${r.type}" }
             require(r.isTracking) { "floor plane must be tracking at confirmation" }
-            return FloorSelection(root, referencePlane)
+            return FloorSelection(referencePlane)
         }
     }
 }

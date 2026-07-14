@@ -5,8 +5,6 @@ import itr.core.geometry.Vec3
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 
 private class FakePlane(
     override val id: String,
@@ -44,23 +42,6 @@ class FloorSelectionTest {
         val b = FakePlane("b", PlaneType.HORIZONTAL_UP, 0.0, 1.0, subsumedBy = a)
         a.subsumedBy = b   // cycle
         assertFailsWith<IllegalStateException> { resolveRoot(a) }
-    }
-
-    @Test fun `eligibility survives the CONFIRMED root being subsumed later (live comparison)`() {
-        val root = FakePlane("root", PlaneType.HORIZONTAL_UP, 0.0, 6.0)
-        val sel = FloorSelection.confirm(root, referencePlane = ref)
-        val bigger = FakePlane("bigger", PlaneType.HORIZONTAL_UP, 0.0, 9.0)
-        root.subsumedBy = bigger                 // ARCore merged the confirmed root into a bigger plane
-        val hitOnBigger = FakePlane("h", PlaneType.HORIZONTAL_UP, 0.0, 9.0, subsumedBy = bigger)
-        assertTrue(sel.isHitEligible(root))       // confirmed root now resolves to bigger
-        assertTrue(sel.isHitEligible(hitOnBigger))
-        assertTrue(sel.isHitEligible(bigger))
-    }
-
-    @Test fun `a hit on an unrelated plane is not eligible`() {
-        val root = FakePlane("root", PlaneType.HORIZONTAL_UP, 0.0, 6.0)
-        val other = FakePlane("other", PlaneType.HORIZONTAL_UP, 0.0, 5.0)
-        assertFalse(FloorSelection.confirm(root, ref).isHitEligible(other))
     }
 
     @Test fun `confirm rejects a non-upward or non-tracking plane`() {

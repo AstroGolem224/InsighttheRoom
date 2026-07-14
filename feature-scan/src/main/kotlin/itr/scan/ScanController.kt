@@ -18,6 +18,7 @@ import itr.core.geometry.RoomBasis
 import itr.core.geometry.Vec2
 import itr.core.geometry.Vec3
 import itr.core.geometry.buildFloorPlan
+import itr.core.geometry.intersectRay
 import itr.core.geometry.pointInPolygon
 import itr.core.model.Building
 import itr.core.model.ScannedRoom
@@ -36,7 +37,6 @@ import itr.persistence.ScanRepository
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import kotlin.math.abs
 
 class ScanController(
     val session: ArCoreSession,
@@ -314,14 +314,9 @@ class ScanController(
     private fun projectedEligibleHit(point: DisplayPoint): Vec3? {
         val floor = floorSelection ?: return failUiNull("Confirm the floor first")
         val frame = session.latestFrame() ?: return failUiNull("No current AR frame")
-        val (hitPlane, hit) = frame.hitTest(point) ?: return failUiNull("No plane hit")
-        if (!floor.isHitEligible(hitPlane)) return failUiNull("Tap must hit the confirmed floor")
-        val reference = floor.referencePlane
-        val signedDistance = (hit - reference.point).dot(reference.normal.normalized())
-        if (!signedDistance.isFinite() || abs(signedDistance) > FROZEN_PLANE_DRIFT_TOLERANCE_M) {
-            return failUiNull("Floor hit drifted beyond $FROZEN_PLANE_DRIFT_TOLERANCE_M m")
-        }
-        return reference.project(hit)
+        val ray = frame.cameraRay(point) ?: return failUiNull("Move so the floor is in view, then tap")
+        return floor.referencePlane.intersectRay(ray, MAX_CORNER_DISTANCE_M, MIN_CORNER_INCIDENCE)
+            ?: return failUiNull("Aim down at the floor corner (within $MAX_CORNER_DISTANCE_M m)")
     }
 
     private fun currentPlan() = basis?.let { roomBasis ->
@@ -381,6 +376,7 @@ class ScanController(
         private const val TAG = "ScanController"
         private const val MAX_IN_FLIGHT = 2
         private const val MIN_EDGE_M = 0.05
-        private const val FROZEN_PLANE_DRIFT_TOLERANCE_M = 0.03
+        private const val MAX_CORNER_DISTANCE_M = 8.0
+        private const val MIN_CORNER_INCIDENCE = 0.26
     }
 }
